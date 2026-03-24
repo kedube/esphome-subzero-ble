@@ -1,0 +1,641 @@
+# Sub-Zero / Wolf / Cove Appliance BLE Package
+# Include with vars: prefix, appliance_name, appliance_mac, appliance_pin
+# Optional vars: freezer_sensors_internal, ice_maker_sensor_internal
+#   Set to "false" to expose freezer/ice maker sensors in HA
+#
+# Example:
+#   packages:
+#     basement_fridge: !include
+#       file: subzero_appliance.yaml
+#       vars:
+#         prefix: "szg"
+#         appliance_name: "Basement Fridge"
+#         appliance_mac: !secret basement_fridge_mac
+#         appliance_pin: !secret basement_fridge_pin
+#     main_fridge: !include
+#       file: subzero_appliance.yaml
+#       vars:
+#         prefix: "szg2"
+#         appliance_name: "Main Fridge"
+#         appliance_mac: !secret main_fridge_mac
+#         appliance_pin: !secret main_fridge_pin
+#         freezer_sensors_internal: "false"
+#         ice_maker_sensor_internal: "false"
+
+substitutions:
+  freezer_sensors_internal: "true"
+  ice_maker_sensor_internal: "true"
+
+globals:
+  - id: ${prefix}_phase
+    type: int
+    initial_value: "0"
+  - id: ${prefix}_d4_handle
+    type: int
+    initial_value: "0"
+  - id: ${prefix}_d5_handle
+    type: int
+    initial_value: "0"
+  - id: ${prefix}_json_buf
+    type: std::string
+    restore_value: false
+  - id: ${prefix}_stored_pin
+    type: std::string
+    restore_value: true
+    initial_value: '"${appliance_pin}"'
+  - id: ${prefix}_pin_confirmed
+    type: bool
+    restore_value: true
+    initial_value: "true"
+
+ble_client:
+  - mac_address: ${appliance_mac}
+    name: "SZG ${appliance_name}"
+    id: ${prefix}_appliance
+    auto_connect: true
+    on_passkey_request:
+      then:
+        - lambda: |-
+            std::string pin = id(${prefix}_stored_pin);
+            if (pin.empty()) {
+              ESP_LOGW("ble", "[${appliance_name}] Passkey requested but no PIN set!");
+              id(${prefix}_debug).publish_state("Enter PIN in HA, then reconnect.");
+            }
+            ESP_LOGI("ble", "[${appliance_name}] Replying with PIN: %s", pin.empty() ? "(none)" : pin.c_str());
+        - ble_client.passkey_reply:
+            id: ${prefix}_appliance
+            passkey: !lambda |-
+              std::string pin = id(${prefix}_stored_pin);
+              return pin.empty() ? 0 : atoi(pin.c_str());
+    on_connect:
+      then:
+        - lambda: |-
+            int phase = id(${prefix}_phase);
+            if (phase == 0) {
+              id(${prefix}_phase) = 1;
+              ESP_LOGI("ble", "[${appliance_name}] Connected, discovering chars...");
+              id(${prefix}_debug).publish_state("Connected, discovering...");
+              id(${prefix}_post_bond).execute();
+            } else if (phase >= 1) {
+              if (id(${prefix}_d5_handle) > 0) {
+                ESP_LOGI("gatt", "[${appliance_name}] D5 already found, skipping");
+                return;
+              }
+              if (id(${prefix}_post_bond).is_running()) {
+                ESP_LOGI("ble", "[${appliance_name}] post_bond still running, skipping");
+                return;
+              }
+              id(${prefix}_phase) = phase + 1;
+              ESP_LOGI("ble", "[${appliance_name}] Reconnected, starting discovery");
+              id(${prefix}_debug).publish_state("Reconnected, discovering...");
+              id(${prefix}_post_bond).execute();
+            }
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(${prefix}_phase) = 0;
+            id(${prefix}_d4_handle) = 0;
+            id(${prefix}_d5_handle) = 0;
+            id(${prefix}_json_buf).clear();
+            id(${prefix}_post_bond).stop();
+            id(${prefix}_subscribe).stop();
+            ESP_LOGI("ble", "[${appliance_name}] Disconnected");
+            id(${prefix}_debug).publish_state("Disconnected");
+
+sensor:
+  - platform: template
+    name: "${appliance_name} Set Temperature"
+    id: ${prefix}_set_temp
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "${appliance_name} Freezer Temperature"
+    id: ${prefix}_frz_temp
+    unit_of_measurement: "°F"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    icon: "mdi:snowflake-thermometer"
+    internal: ${freezer_sensors_internal}
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${prefix}_appliance
+    name: "${appliance_name} D5 Notify"
+    id: ${prefix}_d5_notify
+    internal: true
+    service_uuid: 'E20A39F4-73F5-4BC4-A12F-17D1AD07A961'
+    characteristic_uuid: '08590F7E-DB05-467E-8757-72F6FAEB13D5'
+    notify: true
+    update_interval: never
+    lambda: |-
+      auto &buf = id(${prefix}_json_buf);
+      if (buf.capacity() < 2048) buf.reserve(2048);
+      if (buf.size() > 4096) { buf.clear(); return {}; }
+      buf.append((char*)x.data(), x.size());
+      int depth = 0;
+      bool complete = false;
+      for (char c : buf) {
+        if (c == '{') depth++;
+        else if (c == '}') { depth--; if (depth == 0) { complete = true; break; } }
+      }
+      if (complete) {
+        id(${prefix}_parse_json).execute();
+      }
+      return {};
+
+binary_sensor:
+  - platform: template
+    name: "${appliance_name} Door"
+    id: ${prefix}_door_ajar
+    device_class: door
+
+  - platform: template
+    name: "${appliance_name} Sabbath Mode"
+    id: ${prefix}_sabbath_on
+    icon: "mdi:candelabra"
+
+  - platform: template
+    name: "${appliance_name} Freezer Door"
+    id: ${prefix}_frz_door_ajar
+    device_class: door
+    internal: ${freezer_sensors_internal}
+
+  - platform: template
+    name: "${appliance_name} Ice Maker"
+    id: ${prefix}_ice_maker
+    icon: "mdi:ice-cream"
+    internal: ${ice_maker_sensor_internal}
+
+  - platform: template
+    name: "${appliance_name} Service Required"
+    id: ${prefix}_svc_required
+    device_class: problem
+
+text_sensor:
+  - platform: template
+    name: "${appliance_name} Status"
+    id: ${prefix}_debug
+
+  - platform: template
+    name: "${appliance_name} Raw JSON"
+    id: ${prefix}_raw_json
+    entity_category: diagnostic
+
+  - platform: template
+    name: "${appliance_name} Model"
+    id: ${prefix}_model
+    icon: "mdi:devices"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "${appliance_name} Uptime"
+    id: ${prefix}_uptime
+    icon: "mdi:timer-outline"
+    entity_category: diagnostic
+
+text:
+  - platform: template
+    name: "${appliance_name} PIN"
+    id: ${prefix}_pin_input
+    icon: "mdi:key-variant"
+    entity_category: config
+    min_length: 0
+    max_length: 10
+    mode: text
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x.length() > 0) {
+              id(${prefix}_stored_pin) = x;
+              ESP_LOGI("szg", "[${appliance_name}] PIN updated: %s", x.c_str());
+            }
+
+button:
+  - platform: template
+    name: "Connect to ${appliance_name}"
+    icon: "mdi:bluetooth-connect"
+    on_press:
+      - logger.log: "[${appliance_name}] Initiating connection..."
+      - lambda: |-
+          id(${prefix}_phase) = 0;
+          id(${prefix}_d4_handle) = 0;
+          id(${prefix}_d5_handle) = 0;
+          id(${prefix}_json_buf).clear();
+          id(${prefix}_post_bond).stop();
+          id(${prefix}_subscribe).stop();
+      - ble_client.connect:
+          id: ${prefix}_appliance
+
+  - platform: template
+    name: "${appliance_name} Start Pairing"
+    icon: "mdi:key-plus"
+    on_press:
+      - lambda: |-
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) {
+            id(${prefix}_debug).publish_state("ERROR: Not connected. Press Connect first.");
+            return;
+          }
+          auto *client = id(${prefix}_appliance);
+          std::string cmd = "{\"cmd\":\"display_pin\",\"params\":{\"duration\": 30}}\n";
+          esp_err_t err = esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] display_pin -> D5 err=%d", err);
+          id(${prefix}_debug).publish_state("Check appliance display for PIN.");
+
+  - platform: template
+    name: "${appliance_name} Submit PIN & Unlock"
+    icon: "mdi:lock-open-variant"
+    on_press:
+      - lambda: |-
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) {
+            id(${prefix}_debug).publish_state("ERROR: Not connected.");
+            return;
+          }
+          std::string pin = id(${prefix}_stored_pin);
+          if (pin.empty()) {
+            id(${prefix}_debug).publish_state("ERROR: Enter PIN first.");
+            return;
+          }
+          auto *client = id(${prefix}_appliance);
+          std::string cmd = "{\"cmd\":\"unlock_channel\",\"params\":{\"pin\":\"" + pin + "\"}}\n";
+          esp_err_t err = esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] unlock_channel (PIN=%s) err=%d", pin.c_str(), err);
+          id(${prefix}_debug).publish_state("Unlock sent...");
+      - delay: 3s
+      - lambda: |-
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) return;
+          auto *client = id(${prefix}_appliance);
+          std::string cmd = "{\"cmd\":\"get_async\"}\n";
+          esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+
+  - platform: template
+    name: "Poll ${appliance_name}"
+    icon: "mdi:refresh"
+    on_press:
+      - lambda: |-
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) {
+            id(${prefix}_debug).publish_state("ERROR: Not connected");
+            return;
+          }
+          auto *client = id(${prefix}_appliance);
+          std::string cmd = "{\"cmd\":\"get_async\"}\n";
+          esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] POLL: get_async");
+          id(${prefix}_debug).publish_state("Polling...");
+
+  - platform: template
+    name: "Disconnect ${appliance_name}"
+    icon: "mdi:bluetooth-off"
+    on_press:
+      - ble_client.disconnect:
+          id: ${prefix}_appliance
+
+  - platform: template
+    name: "Reset ${appliance_name} Pairing"
+    icon: "mdi:bluetooth-settings"
+    entity_category: config
+    on_press:
+      - logger.log: "[${appliance_name}] Removing bond..."
+      - lambda: |-
+          id(${prefix}_pin_confirmed) = false;
+          auto *client = id(${prefix}_appliance);
+          esp_bd_addr_t addr;
+          memcpy(addr, client->get_remote_bda(), 6);
+          esp_ble_gattc_cache_clean(addr);
+      - ble_client.disconnect:
+          id: ${prefix}_appliance
+      - delay: 1s
+      - ble_client.remove_bond:
+          id: ${prefix}_appliance
+      - lambda: |-
+          id(${prefix}_debug).publish_state("Pairing reset. Press Connect to re-pair.");
+
+interval:
+  - interval: 120s
+    then:
+      - lambda: |-
+          if (!id(${prefix}_pin_confirmed)) return;
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) return;
+          auto *client = id(${prefix}_appliance);
+          std::string cmd = "{\"cmd\":\"get_async\"}\n";
+          esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGD("szg", "[${appliance_name}] Periodic get_async");
+
+script:
+  # === JSON parser — runs in main loop (NOT in BLE callback) ===
+  - id: ${prefix}_parse_json
+    mode: single
+    then:
+      - lambda: |-
+          auto &json = id(${prefix}_json_buf);
+          size_t start = json.find('{');
+          if (start == std::string::npos) { json.clear(); return; }
+          if (start > 0) json.erase(0, start);
+          ESP_LOGI("szg", "[${appliance_name}] Parsing JSON (%d bytes)", json.size());
+          if (json.size() < 255) {
+            id(${prefix}_raw_json).publish_state(json);
+          } else {
+            ESP_LOGI("szg", "[${appliance_name}] Response: %.200s...", json.c_str());
+          }
+          const char *js = json.c_str();
+          bool should_parse = true;
+          {
+            size_t sp = json.find("\"status\":");
+            if (sp != std::string::npos) {
+              int st = atoi(js + sp + 9);
+              if (st != 0) {
+                ESP_LOGW("szg", "[${appliance_name}] status=%d, skipping", st);
+                should_parse = false;
+              }
+            }
+          }
+          if (should_parse) {
+            size_t pin_pos = json.find("\"pin\":");
+            if (pin_pos != std::string::npos) {
+              pin_pos += 6;
+              while (pin_pos < json.size() && (js[pin_pos] == ' ' || js[pin_pos] == '"')) pin_pos++;
+              size_t pin_end = json.find('"', pin_pos);
+              if (pin_end != std::string::npos && pin_end - pin_pos <= 10) {
+                char pin_buf[16] = {};
+                memcpy(pin_buf, js + pin_pos, pin_end - pin_pos);
+                id(${prefix}_stored_pin) = pin_buf;
+                id(${prefix}_pin_confirmed) = true;
+                id(${prefix}_pin_input).publish_state(pin_buf);
+                ESP_LOGI("szg", "[${appliance_name}] PIN confirmed: %s", pin_buf);
+                id(${prefix}_debug).publish_state("PIN confirmed! Channel unlocked.");
+              }
+            }
+          }
+          auto find_num = [&](const char *key) -> float {
+            const char *p = strstr(js, key);
+            if (!p) return NAN;
+            p += strlen(key);
+            while (*p == ' ' || *p == ':') p++;
+            return atof(p);
+          };
+          auto find_bool = [&](const char *key) -> int {
+            const char *p = strstr(js, key);
+            if (!p) return -1;
+            p += strlen(key);
+            while (*p == ' ' || *p == ':') p++;
+            if (strncmp(p, "true", 4) == 0) return 1;
+            if (strncmp(p, "false", 5) == 0) return 0;
+            return -1;
+          };
+          if (should_parse) {
+            float temp = find_num("\"ref_set_temp\"");
+            if (!std::isnan(temp)) id(${prefix}_set_temp).publish_state(temp);
+            int door = find_bool("\"ref_door_ajar\"");
+            if (door >= 0) id(${prefix}_door_ajar).publish_state(door == 1);
+            float frz_temp = find_num("\"frz_set_temp\"");
+            if (!std::isnan(frz_temp)) id(${prefix}_frz_temp).publish_state(frz_temp);
+            int frz_door = find_bool("\"frz_door_ajar\"");
+            if (frz_door >= 0) id(${prefix}_frz_door_ajar).publish_state(frz_door == 1);
+            int ice = find_bool("\"ice_maker_on\"");
+            if (ice >= 0) id(${prefix}_ice_maker).publish_state(ice == 1);
+            int sabbath = find_bool("\"sabbath_on\"");
+            if (sabbath >= 0) id(${prefix}_sabbath_on).publish_state(sabbath == 1);
+            int svc = find_bool("\"service_required\"");
+            if (svc >= 0) id(${prefix}_svc_required).publish_state(svc == 1);
+            auto extract_str = [&](const char *key, char *buf, size_t buflen) -> bool {
+              const char *p = strstr(js, key);
+              if (!p) return false;
+              p += strlen(key);
+              while (*p == ' ' || *p == ':') p++;
+              if (*p != '"') return false;
+              p++;
+              const char *end = strchr(p, '"');
+              if (!end || (size_t)(end - p) >= buflen) return false;
+              memcpy(buf, p, end - p);
+              buf[end - p] = 0;
+              return true;
+            };
+            char val[64];
+            if (extract_str("\"appliance_model\"", val, sizeof(val)))
+              id(${prefix}_model).publish_state(val);
+            if (extract_str("\"uptime\"", val, sizeof(val)))
+              id(${prefix}_uptime).publish_state(val);
+          }
+          json.clear();
+
+  - id: ${prefix}_post_bond
+    mode: restart
+    then:
+      - delay: 2s
+      - lambda: |-
+          auto *client = id(${prefix}_appliance);
+          esp_gattc_db_elem_t db[64];
+          uint16_t count = 64;
+          esp_err_t err = esp_ble_gattc_get_db(
+            client->get_gattc_if(), client->get_conn_id(),
+            0x0001, 0xFFFF, db, &count);
+          ESP_LOGI("poll", "[${appliance_name}] Initial get_db: err=%d count=%d", err, count);
+          if (err == ESP_OK) {
+            for (int i = 0; i < count; i++) {
+              auto &e = db[i];
+              const char *t = "?";
+              if (e.type == ESP_GATT_DB_PRIMARY_SERVICE) t = "SVC";
+              else if (e.type == ESP_GATT_DB_CHARACTERISTIC) t = "CHR";
+              else if (e.type == ESP_GATT_DB_DESCRIPTOR) t = "DSC";
+              char us[42] = {0};
+              if (e.uuid.len == ESP_UUID_LEN_16)
+                snprintf(us, sizeof(us), "%04X", e.uuid.uuid.uuid16);
+              else if (e.uuid.len == ESP_UUID_LEN_128) {
+                uint8_t *u = e.uuid.uuid.uuid128;
+                snprintf(us, sizeof(us),
+                  "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                  u[15],u[14],u[13],u[12],u[11],u[10],u[9],u[8],
+                  u[7],u[6],u[5],u[4],u[3],u[2],u[1],u[0]);
+              }
+              ESP_LOGI("gatt", "  [%d] %s h=%d uuid=%s p=0x%02X", i, t, e.attribute_handle, us, e.properties);
+              if (e.type == ESP_GATT_DB_CHARACTERISTIC && e.uuid.len == ESP_UUID_LEN_128) {
+                uint8_t suffix = e.uuid.uuid.uuid128[0];
+                if (suffix == 0xD4) id(${prefix}_d4_handle) = e.attribute_handle;
+                else if (suffix == 0xD5) id(${prefix}_d5_handle) = e.attribute_handle;
+              }
+            }
+          }
+          if (id(${prefix}_d5_handle) > 0) {
+            ESP_LOGI("ble", "[${appliance_name}] D5 found immediately!");
+            id(${prefix}_debug).publish_state("D5 found! Starting unlock...");
+            id(${prefix}_subscribe).execute();
+            return;
+          }
+          ESP_LOGI("ble", "[${appliance_name}] No D5 yet. Requesting encryption...");
+          uint8_t addr[6];
+          memcpy(addr, client->get_remote_bda(), 6);
+          esp_ble_set_encryption(addr, ESP_BLE_SEC_ENCRYPT_MITM);
+          id(${prefix}_debug).publish_state("Requesting encryption...");
+      - delay: 5s
+      - lambda: |-
+          if (id(${prefix}_d5_handle) > 0) return;
+          auto *client = id(${prefix}_appliance);
+          ESP_LOGI("ble", "[${appliance_name}] Post-encryption: refreshing GATT cache...");
+          esp_bd_addr_t addr;
+          memcpy(addr, client->get_remote_bda(), 6);
+          esp_ble_gattc_cache_refresh(addr);
+      - delay: 500ms
+      - lambda: |-
+          if (id(${prefix}_d5_handle) > 0) return;
+          auto *client = id(${prefix}_appliance);
+          esp_ble_gattc_search_service(client->get_gattc_if(), client->get_conn_id(), NULL);
+      - delay: 5s
+      - lambda: |-
+          if (id(${prefix}_d5_handle) > 0) return;
+          auto *client = id(${prefix}_appliance);
+          esp_gattc_db_elem_t db[64];
+          uint16_t count = 64;
+          esp_ble_gattc_get_db(client->get_gattc_if(), client->get_conn_id(), 0x0001, 0xFFFF, db, &count);
+          ESP_LOGI("poll", "[${appliance_name}] Poll 1: count=%d", count);
+          for (int i = 0; i < count; i++) {
+            if (db[i].type == ESP_GATT_DB_CHARACTERISTIC && db[i].uuid.len == ESP_UUID_LEN_128) {
+              uint8_t s = db[i].uuid.uuid.uuid128[0];
+              if (s == 0xD4) id(${prefix}_d4_handle) = db[i].attribute_handle;
+              else if (s == 0xD5) id(${prefix}_d5_handle) = db[i].attribute_handle;
+            }
+          }
+          if (id(${prefix}_d5_handle) > 0) { id(${prefix}_subscribe).execute(); return; }
+          id(${prefix}_debug).publish_state("Poll 1: waiting...");
+      - delay: 5s
+      - lambda: |-
+          if (id(${prefix}_d5_handle) > 0) return;
+          auto *client = id(${prefix}_appliance);
+          esp_gattc_db_elem_t db[64];
+          uint16_t count = 64;
+          esp_ble_gattc_get_db(client->get_gattc_if(), client->get_conn_id(), 0x0001, 0xFFFF, db, &count);
+          ESP_LOGI("poll", "[${appliance_name}] Poll 2: count=%d", count);
+          for (int i = 0; i < count; i++) {
+            if (db[i].type == ESP_GATT_DB_CHARACTERISTIC && db[i].uuid.len == ESP_UUID_LEN_128) {
+              uint8_t s = db[i].uuid.uuid.uuid128[0];
+              if (s == 0xD4) id(${prefix}_d4_handle) = db[i].attribute_handle;
+              else if (s == 0xD5) id(${prefix}_d5_handle) = db[i].attribute_handle;
+            }
+          }
+          if (id(${prefix}_d5_handle) > 0) { id(${prefix}_subscribe).execute(); return; }
+          id(${prefix}_debug).publish_state("Poll 2: waiting...");
+      - delay: 5s
+      - lambda: |-
+          if (id(${prefix}_d5_handle) > 0) return;
+          auto *client = id(${prefix}_appliance);
+          esp_gattc_db_elem_t db[64];
+          uint16_t count = 64;
+          esp_ble_gattc_get_db(client->get_gattc_if(), client->get_conn_id(), 0x0001, 0xFFFF, db, &count);
+          ESP_LOGI("poll", "[${appliance_name}] Poll 3: count=%d", count);
+          for (int i = 0; i < count; i++) {
+            if (db[i].type == ESP_GATT_DB_CHARACTERISTIC && db[i].uuid.len == ESP_UUID_LEN_128) {
+              uint8_t s = db[i].uuid.uuid.uuid128[0];
+              if (s == 0xD4) id(${prefix}_d4_handle) = db[i].attribute_handle;
+              else if (s == 0xD5) id(${prefix}_d5_handle) = db[i].attribute_handle;
+            }
+          }
+          if (id(${prefix}_d5_handle) > 0) { id(${prefix}_subscribe).execute(); return; }
+          ESP_LOGW("ble", "[${appliance_name}] No D5 after 20s. Reconnecting...");
+          id(${prefix}_debug).publish_state("No D5 found. Reconnecting...");
+          id(${prefix}_phase) = 1;
+      - if:
+          condition:
+            lambda: 'return id(${prefix}_d5_handle) == 0;'
+          then:
+            - ble_client.disconnect:
+                id: ${prefix}_appliance
+            - delay: 2s
+            - lambda: |-
+                auto *client = id(${prefix}_appliance);
+                esp_bd_addr_t addr;
+                memcpy(addr, client->get_remote_bda(), 6);
+                esp_ble_gattc_cache_clean(addr);
+                esp_ble_gattc_cache_refresh(addr);
+            - delay: 1s
+            - ble_client.connect:
+                id: ${prefix}_appliance
+
+  - id: ${prefix}_subscribe
+    mode: restart
+    then:
+      # Subscribe D5, then auto-unlock if PIN is saved
+      # All commands MUST end with \n — the appliance's serial parser requires it!
+      - lambda: |-
+          auto *client = id(${prefix}_appliance);
+          uint16_t d5 = id(${prefix}_d5_handle);
+          if (d5 == 0) {
+            ESP_LOGE("ble", "[${appliance_name}] D5 handle not set!");
+            id(${prefix}_debug).publish_state("ERROR: D5 handle not found");
+            return;
+          }
+          id(${prefix}_d5_notify)->handle = d5;
+          ESP_LOGI("ble", "[${appliance_name}] Injected D5 handle %d", d5);
+          uint16_t d4 = id(${prefix}_d4_handle);
+          uint8_t ind_en[2] = {0x02, 0x00};
+          uint16_t d5_cccd = d5 + 2;
+          esp_err_t err = esp_ble_gattc_write_char_descr(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5_cccd, 2, ind_en,
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] Subscribe D5 (h=%d, CCCD=%d): err=%d", d5, d5_cccd, err);
+          esp_ble_gattc_register_for_notify(
+            client->get_gattc_if(), client->get_remote_bda(), d5);
+          if (d4 > 0) {
+            uint16_t d4_cccd = d4 + 2;
+            esp_ble_gattc_write_char_descr(
+              client->get_gattc_if(), client->get_conn_id(),
+              d4_cccd, 2, ind_en,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+            esp_ble_gattc_register_for_notify(
+              client->get_gattc_if(), client->get_remote_bda(), d4);
+            ESP_LOGI("ble", "[${appliance_name}] Subscribe D4 (h=%d) for diagnostics", d4);
+          }
+          id(${prefix}_json_buf).clear();
+      - delay: 2s
+      - lambda: |-
+          auto *client = id(${prefix}_appliance);
+          uint16_t d5 = id(${prefix}_d5_handle);
+          std::string pin = id(${prefix}_stored_pin);
+          if (pin.empty() || !id(${prefix}_pin_confirmed)) {
+            ESP_LOGI("ble", "[${appliance_name}] No saved PIN. Waiting for user to pair.");
+            id(${prefix}_debug).publish_state("Connected! Press 'Start Pairing', then enter PIN.");
+            return;
+          }
+          std::string cmd = "{\"cmd\":\"unlock_channel\",\"params\":{\"pin\":\"" + pin + "\"}}\n";
+          esp_err_t err = esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] Auto-unlock (PIN=%s) err=%d", pin.c_str(), err);
+          id(${prefix}_debug).publish_state("Auto-unlocking...");
+      - delay: 3s
+      - lambda: |-
+          if (!id(${prefix}_pin_confirmed)) return;
+          auto *client = id(${prefix}_appliance);
+          uint16_t d5 = id(${prefix}_d5_handle);
+          std::string cmd = "{\"cmd\":\"get_async\"}\n";
+          esp_err_t err = esp_ble_gattc_write_char(
+            client->get_gattc_if(), client->get_conn_id(),
+            d5, cmd.size(), (uint8_t*)cmd.data(),
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+          ESP_LOGI("ble", "[${appliance_name}] get_async err=%d", err);
+          id(${prefix}_debug).publish_state("Connected and polling.");

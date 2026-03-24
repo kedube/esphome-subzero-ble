@@ -1,0 +1,8 @@
+# ignore all files and all directories
+*
+*/
+
+!.gitignore
+!README.adoc
+!subzero.yaml
+!subzero_appliance.yaml

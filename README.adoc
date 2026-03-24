@@ -1,0 +1,424 @@
+= ESPHome Sub-Zero BLE
+:toc: macro
+:toc-title: Contents
+:toclevels: 3
+:icons: font
+
+Connect Sub-Zero kitchen appliances to Home Assistant over Bluetooth Low Energy (BLE), using an ESP32 running https://esphome.io[ESPHome]. *FULLY LOCAL*.
+
+toc::[]
+
+== Overview
+
+Sub-Zero Group (SZG) appliances manufactured since ~2020 include a BLE radio that the official _Sub-Zero Group Owner_ mobile app (Android/iOS) uses for configuration and monitoring.
+This project reverse-engineers that BLE protocol and reimplements the connection, pairing, and polling logic entirely in ESPHome YAML + inline C++ lambdas — no custom components or external libraries required.
+
+=== What You Get
+
+[cols="1,3"]
+|===
+| Sensor | Description
+
+| *Refrigerator Set Temperature* | Current fridge setpoint (°F)
+| *Freezer Set Temperature* | Current freezer setpoint (°F) _(optional)_
+| *Refrigerator Door* | Open/closed binary sensor
+| *Freezer Door* | Open/closed binary sensor _(optional)_
+| *Ice Maker* | On/off binary sensor _(optional)_
+| *Sabbath Mode* | On/off binary sensor
+| *Service Required* | Alerts when the appliance flags a service need
+| *Appliance Model* | Model number (e.g. `DEU2450R`, `313`)
+| *Appliance Uptime* | Time since last power cycle
+| *Raw JSON* | Full JSON response for debugging
+|===
+
+=== Tested Appliances
+
+[cols="1,1,1"]
+|===
+| Model | Type | Status
+
+| DEU2450R | Under-counter refrigerator | ✅ Fully working
+| 313 | French-door fridge/freezer with ice maker | ✅ Fully working
+|===
+
+Other Sub-Zero, Wolf, and Cove appliances with BLE should work — they all use the same protocol.
+If you test with a different model, please open an issue or PR to update this table.
+
+== Requirements
+
+* An *ESP32* board.
+  The https://shop.everythingsmart.io/products/everything-presence-one-kit[Everything Presence One] works well as a dedicated appliance hub.
+* *ESPHome 2024.6+* (tested on 2026.3.0)
+* *Python 3.10+* and a working ESPHome installation (see <<getting-started>>)
+* The *6-digit PIN* from your appliance display (one-time)
+
+== BLE Protocol Reference
+
+This section documents the Sub-Zero BLE protocol as reverse-engineered from the official Android APK and live traffic analysis.
+
+=== GATT Service Structure
+
+All Sub-Zero appliances expose a single custom GATT service:
+
+[cols="1,2"]
+|===
+| Item | Value
+
+| *Service UUID* | `E20A39F4-73F5-4BC4-A12F-17D1AD07A961`
+| *D5 Characteristic* | `08590F7E-DB05-467E-8757-72F6FAEB13D5`
+| *D4 Characteristic* | `08590F7E-DB05-467E-8757-72F6FAEB13D4`
+|===
+
+* **D5** is the encrypted command/response channel. It only appears in the GATT database _after_ BLE-level encryption (bonding) is established.
+* **D4** is an open (unencrypted) diagnostic channel that sends periodic status messages.
+
+=== Connection & Authentication Flow
+
+The full handshake follows these steps:
+
+[source]
+----
+  ESP32                           Appliance
+    │                                 │
+    ├──── BLE Connect ───────────────►│
+    │                                 │
+    │◄─── Service Discovery ─────────┤  (only D4 visible initially)
+    │                                 │
+    ├──── Request Encryption ────────►│  esp_ble_set_encryption(MITM)
+    │                                 │
+    │◄─── Passkey Request ───────────┤  (6-digit PIN shown on appliance display)
+    ├──── Passkey Reply ─────────────►│
+    │                                 │
+    │◄─── Bond Complete (KEY_EVTs) ──┤
+    │                                 │
+    ├──── GATT Cache Refresh ────────►│  esp_ble_gattc_cache_refresh()
+    │                                 │
+    │◄─── Service Re-discovery ──────┤  (D5 now visible!)
+    │                                 │
+    ├──── Subscribe D5 (indications) ►│  CCCD = 0x0200
+    ├──── Subscribe D4 (indications) ►│
+    │                                 │
+    ├──── unlock_channel ────────────►│  {"cmd":"unlock_channel","params":{"pin":"XXXXXX"}}\n
+    │◄─── PIN response ──────────────┤  {"status": 0, "resp": {"pin": "XXXXXX"}}
+    │                                 │
+    ├──── get_async ─────────────────►│  {"cmd":"get_async"}\n
+    │◄─── Full JSON state ───────────┤  (fragmented across ~40-byte indications)
+    │                                 │
+----
+
+==== Key Protocol Details
+
+BLE Security:: The appliance requires *Secure Connections with MITM protection and bonding* (`SC_MITM_BOND`).
+The ESP32 must be configured with `IO_CAP_IN` (keyboard-only) so the user can enter the 6-digit passkey displayed on the appliance.
+After the first successful bond, the keys are stored and reconnection is automatic.
+
+Command Framing:: Every command written to D5 *must* end with a newline character (`\n`).
+The appliance's serial parser silently discards any command without it.
+
+Response Fragmentation:: The appliance sends JSON responses as BLE indications, fragmented into chunks of approximately 40 bytes each.
+A full `get_async` response can be 1200–1800 bytes depending on the appliance model, arriving as 30–45 consecutive indications.
+The receiver must buffer and reassemble these fragments by tracking JSON brace depth (`{` / `}`) to detect message completion.
+
+D5 Discovery Timing:: The encrypted D5 characteristic is *not visible* in the GATT database until after bonding completes.
+The implementation must refresh the GATT cache (`esp_ble_gattc_cache_refresh`) and re-run service discovery after encryption is established.
+The code polls up to three times with delays to handle timing variations across different appliance models.
+
+MTU:: Negotiated to 517 bytes, though the appliance still fragments at ~40 bytes per indication.
+
+=== Command Reference
+
+All commands are JSON objects written to D5, terminated with `\n`.
+
+[cols="1,2,2"]
+|===
+| Command | Payload | Response
+
+| `display_pin` | `{"cmd":"display_pin","params":{"duration": 30}}\n` | Displays PIN on appliance for 30 seconds
+| `unlock_channel` | `{"cmd":"unlock_channel","params":{"pin":"XXXXXX"}}\n` | `{"status": 0, "resp": {"pin": "XXXXXX"}}`
+| `get_async` | `{"cmd":"get_async"}\n` | Full appliance state as JSON (see below)
+|===
+
+=== Example `get_async` Response
+
+.Under-counter refrigerator (DEU2450R) — ~1259 bytes
+[%collapsible]
+====
+[source,json]
+----
+{
+  "status": 0,
+  "resp": {
+    "appliance_model": "DEU2450R",
+    "appliance_serial": "11111111",
+    "uptime": "24:03:57",
+    "sabbath_on": false,
+    "service_required": false,
+    "ref_door_ajar": false,
+    "ref_set_temp": 40,
+    "notifs": []
+  }
+}
+----
+====
+
+.French-door fridge/freezer (313) — ~1713 bytes
+[%collapsible]
+====
+[source,json]
+----
+{
+  "status": 0,
+  "resp": {
+    "appliance_model": "313",
+    "appliance_serial": "2222222",
+    "uptime": "37:02:05",
+    "sabbath_on": false,
+    "service_required": false,
+    "ref_door_ajar": false,
+    "ref_set_temp": 38,
+    "frz_door_ajar": false,
+    "frz_set_temp": 0,
+    "ice_maker_on": true,
+    "max_ice_on": false,
+    "night_ice_on": false,
+    "water_filter_gal_remaining": 86,
+    "water_filter_pct_remaining": 0,
+    "air_filter_pct_remaining": 0,
+    "air_filter_on": true,
+    "notifs": [...]
+  }
+}
+----
+====
+
+Different appliance types include different properties. Refrigerator-only units won't have `frz_*` or `ice_maker_*` keys. This can be made optional in the ESPHome config with the `*_internal` flags.
+
+[[getting-started]]
+== Getting Started
+
+=== 1. Install ESPHome
+
+[source,bash]
+----
+python3 -m venv esphome-venv
+source esphome-venv/bin/activate
+pip install esphome
+----
+
+=== 2. Clone This Repository
+
+[source,bash]
+----
+git clone https://github.com/JonGilmore/esphome-subzero-ble.git
+cd esphome-subzero-ble
+----
+
+=== 3. Get Your Appliance PIN
+
+You need the 6-digit PIN from your appliance. There are two ways:
+
+. **From the official app:** Open the _Sub-Zero Group Owner_ app, connect to your appliance, and note the PIN shown during pairing. *You will have to delete the BT pairing from your phone after this to allow the ESP32 to connect.*
+. **From the appliance display:** After ESP32 connects and bonds, press the "Start Pairing" button in Home Assistant — the PIN will appear on the appliance's physical display for 30 seconds.
+
+=== 4. Create `secrets.yaml`
+
+Create a `secrets.yaml` file in the project root (this file is git-ignored):
+
+[source,yaml]
+----
+# Wi-Fi
+wifi_ssid: "your-wifi-ssid"
+wifi_password: "your-wifi-password"
+
+# Appliance 1
+basement_fridge_mac: "00:06:80:XX:XX:XX"
+basement_fridge_pin: "123456"
+
+# Appliance 2 (optional)
+main_fridge_mac: "00:06:80:XX:XX:XX"
+main_fridge_pin: "654321"
+----
+
+TIP: Sub-Zero appliance BLE MAC addresses seem to always start with `00:06:80` - you can confirm with a Bluetooth scanner app on your phone if you're not sure.
+
+=== 5. Configure Your Appliances
+
+Edit `subzero.yaml` and set up your appliance packages:
+
+[source,yaml]
+----
+packages:
+  my_fridge: !include
+    file: subzero_appliance.yaml
+    vars:
+      prefix: "szg"                         # <1>
+      appliance_name: "Kitchen Fridge"      # <2>
+      appliance_mac: !secret my_fridge_mac  # <3>
+      appliance_pin: !secret my_fridge_pin  # <4>
+----
+<1> A short unique prefix for internal IDs (use a different one per appliance)
+<2> The friendly name shown in Home Assistant
+<3> BLE MAC address from `secrets.yaml`
+<4> 6-digit PIN from `secrets.yaml`
+
+==== Appliances With Freezer / Ice Maker
+
+For appliances that have a freezer compartment and/or ice maker, enable those sensors:
+
+[source,yaml]
+----
+packages:
+  main_fridge: !include
+    file: subzero_appliance.yaml
+    vars:
+      prefix: "szg2"
+      appliance_name: "Main Fridge"
+      appliance_mac: !secret main_fridge_mac
+      appliance_pin: !secret main_fridge_pin
+      freezer_sensors_internal: "false"       # <1>
+      ice_maker_sensor_internal: "false"      # <2>
+----
+<1> Exposes freezer temperature and freezer door sensors
+<2> Exposes ice maker on/off sensor
+
+By default these sensors are hidden (`internal: true`) since not all appliances have them.
+
+==== Multiple Appliances
+
+You can monitor multiple appliances from a single ESP32 — just add more package includes with unique prefixes:
+
+[source,yaml]
+----
+packages:
+  fridge_1: !include
+    file: subzero_appliance.yaml
+    vars:
+      prefix: "szg"
+      appliance_name: "Under-Counter Fridge"
+      appliance_mac: !secret fridge_1_mac
+      appliance_pin: !secret fridge_1_pin
+  fridge_2: !include
+    file: subzero_appliance.yaml
+    vars:
+      prefix: "szg2"
+      appliance_name: "Main Fridge"
+      appliance_mac: !secret fridge_2_mac
+      appliance_pin: !secret fridge_2_pin
+      freezer_sensors_internal: "false"
+      ice_maker_sensor_internal: "false"
+----
+
+NOTE: Two concurrent BLE appliance connections is the practical limit on a standard ESP32 - heap usage is tight
+
+== ESPHome Commands
+
+All commands assume you've activated the Python virtual environment:
+
+[source,bash]
+----
+source esphome-venv/bin/activate
+----
+
+=== Compile (Build Without Flashing)
+
+[source,bash]
+----
+esphome compile subzero.yaml
+----
+
+=== Flash via USB
+
+Connect your ESP32 via USB, then compile and flash in one step:
+
+[source,bash]
+----
+ls /dev/cu.*    # find your device name (e.g. /dev/cu.usbserial-210)
+esphome run subzero.yaml --device /dev/cu.usbserial-210    # macOS
+----
+
+This will compile, flash, and immediately show logs.
+
+=== Flash Over-the-Air (OTA)
+
+Once the ESP32 is on your network and running ESPHome, you can flash wirelessly:
+
+[source,bash]
+----
+esphome run subzero.yaml --device 192.168.x.x --no-logs
+----
+
+Replace `192.168.x.x` with your device's IP address.
+
+=== View Logs
+
+.Via USB
+[source,bash]
+----
+esphome logs subzero.yaml --device /dev/cu.usbserial-210
+----
+
+.Via network
+[source,bash]
+----
+esphome logs subzero.yaml --device 192.168.x.x
+----
+
+== Memory Considerations
+
+The ESP32 (non-PSRAM) has only 320 KB of RAM. With BLE client connections, the BLE stack alone consumes a significant portion.
+This integration uses several strategies to avoid out-of-memory crashes:
+
+* JSON response buffers are *pre-reserved* to 2048 bytes at startup to avoid repeated heap reallocation during the 40+ BLE indication fragments
+* All JSON parsing uses *zero-allocation* C string operations (`strstr`, `strncmp`, `atof`) — no `ArduinoJson` or `std::string` parsing
+* JSON parsing runs on the *main loop* (via ESPHome scripts), not inside the BLE notification callback
+* Logger levels are tuned to suppress high-frequency BLE debug messages that would otherwise overwhelm the API frame buffer
+
+If you experience crashes (typically `__cxa_allocate_exception` → `operator new` → `abort()`), try:
+
+. Reducing the number of Home Assistant API connections to the device
+. Setting `ble_client: WARN` in the logger config
+. Reducing poll interval from `120s` to `300s`
+
+== Troubleshooting
+
+[cols="1,2"]
+|===
+| Symptom | Fix
+
+| *D5 characteristic not found*
+| Normal on first connect. The code automatically handles encryption → GATT refresh → rediscovery. Wait 15–20 seconds.
+
+| *"No sensor characteristic found" warning*
+| Expected. ESPHome's BLE sensor component looks for D5 before encryption exposes it. The code injects the correct handle later.
+
+| *Passkey request but no PIN*
+| Enter your PIN via the text input in Home Assistant, then press "Submit PIN & Unlock."
+
+| *Commands sent but no response*
+| Make sure every command string ends with `\n`. This is the most common protocol mistake.
+
+| *Crash loop (abort/reboot cycle)*
+| OOM. See <<Memory Considerations>>. Flash via USB with `esphome run ... --device /dev/cu.usbserial-XXX` to recover.
+
+| *Appliance disconnects after 5 minutes*
+| This is the reconnect timeout working as designed. The ESP32 will automatically reconnect.
+|===
+
+== Project Structure
+
+[source]
+----
+.
+├── README.adoc              # This file
+├── subzero_appliance.yaml   # Reusable package for any SZG appliance
+├── subzero.yaml             # Main ESPHome config (edit this)
+└── secrets.yaml             # Your WiFi/MAC/PIN secrets (git-ignored)
+----
+
+== License
+
+This project is provided as-is for personal, non-commercial use. I have no affiliation with or endorsement by Sub-Zero Group, Inc. Reverse-engineering was done independently for educational purposes. Use at your own risk. 
+
+== Acknowledgments
+
+Protocol details were reverse-engineered from the Sub-Zero Group Owner Android APK and validated through live BLE traffic analysis using an ESP32 and Python https://github.com/hbldh/bleak[bleak] scripts. I reached out to Sub-Zero support to inquire about a local API, but they declined to provide any technical information and stated that they had no plans to support it.

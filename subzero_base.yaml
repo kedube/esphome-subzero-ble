@@ -7,6 +7,40 @@
 substitutions:
   poll_offset: "0s"
   poll_via_d4: "false"
+  # Three values:
+  #   "auto"  (default) - decide at runtime based on the firmware version
+  #                       reported in the first poll response. If the
+  #                       appliance reports `fw: 8.5` (API 5.4), enable
+  #                       push-only mode for this connection. Otherwise
+  #                       leave it off. Reverts to off on disconnect, so
+  #                       the next connect re-evaluates from the fresh
+  #                       version response.
+  #   "true"  - always enable push-only after the first successful poll,
+  #             regardless of detected firmware. Use this if you want the
+  #             behavior on a fw 2.27 appliance for some reason.
+  #   "false" - never enable push-only. Use this to override the auto
+  #             detection (e.g. on a fw 8.5 appliance where you really
+  #             want fresh uptime/diagnostic_status at the cost of the
+  #             ~4 minute reconnect cycle).
+  #
+  # When push-only is active, periodic_poll fires exactly once after each
+  # (re)connect (to land an initial full state) and then returns early
+  # on every subsequent tick - no get_async writes, no subscribe-retry
+  # ladder. Push notifications carry live state (door, light, setpoints,
+  # cook mode, etc.) and keep poll_ok set so zombie detection stays at
+  # zero unless 15 min of total silence happens. Poll-only fields
+  # (model, serial, version, uptime, diagnostic_status) refresh only on
+  # the next reconnect.
+  #
+  # Why this exists: fw 8.5 / API 5.4 appliances (Sub-Zero 313 fridge,
+  # Wolf SO3050PESP wall oven) silently invalidate the unlock session
+  # within ~1 minute. Without push-only mode, the periodic_poll write
+  # gets no response, the subscribe-retry ladder fires, and the session
+  # eventually escalates to a forced reconnect every ~4 min. Push-only
+  # avoids that churn entirely. Matches what the official Sub-Zero
+  # Android app does - see docs/ble-protocol.adoc "Unlock Session
+  # Research".
+  push_only_after_first_poll: "auto"
 
 # NOTE: external_components is declared by the entry-point yaml, not here.
 # Minimal examples use `type: git` with a released ref; personal dev yamls
@@ -65,6 +99,42 @@ globals:
   - id: ${prefix}_poll_miss
     type: int
     initial_value: "0"
+  # Set to true when we write a get_async; cleared when a valid poll
+  # response (`{"status":0,"resp":...}`, parser sets is_poll=true) arrives.
+  # Push notifications do NOT clear it - they're not a response to our
+  # poll. Cleared on disconnect. When still true at the next periodic_poll
+  # tick, the previous poll went unanswered (cold-boot race left the
+  # subscribe chain half-initialized, OR fw 8.5 unlock session expired
+  # silently) and periodic_poll re-runs the full _subscribe chain to
+  # refresh CCCDs + unlock_channel + get_async instead of writing a bare
+  # get_async into the void.
+  - id: ${prefix}_poll_in_flight
+    type: bool
+    initial_value: "false"
+  # Counts consecutive periodic_poll cycles that took the subscribe-retry
+  # branch (poll_in_flight stayed true). Reset on any valid is_poll parse
+  # and on disconnect. When >= 3, the session is wedged at a level even
+  # subscribe (unlock_channel) can't unstick - force a reconnect via
+  # client->disconnect(). auto_connect: true brings the connection back
+  # from scratch.
+  - id: ${prefix}_unanswered_polls
+    type: int
+    initial_value: "0"
+  # One-shot: set true on first valid is_poll parse after (re)connect.
+  # Reset on disconnect. Only used when push_only_after_first_poll is
+  # "true" or "auto" (with fw_85_detected) to gate the periodic_poll
+  # write path - once the initial poll has completed we stop polling
+  # entirely and rely on pushes.
+  - id: ${prefix}_first_poll_done
+    type: bool
+    initial_value: "false"
+  # Set true when parse_json sees `version.fw == "8.5"` in a poll response.
+  # Reset on disconnect. Used by `push_only_after_first_poll: "auto"` to
+  # auto-enable push-only mode on appliances whose unlock session expires
+  # within ~1 minute, without requiring per-appliance configuration.
+  - id: ${prefix}_fw_85_detected
+    type: bool
+    initial_value: "false"
   - id: ${prefix}_debug_mode
     type: bool
     initial_value: "false"
@@ -128,6 +198,10 @@ ble_client:
       then:
         - lambda: |-
             id(${prefix}_json_buf).clear();
+            id(${prefix}_poll_in_flight) = false;
+            id(${prefix}_unanswered_polls) = 0;
+            id(${prefix}_first_poll_done) = false;
+            id(${prefix}_fw_85_detected) = false;
             id(${prefix}_post_bond).stop();
             id(${prefix}_subscribe).stop();
             id(${prefix}_fast_reconnect).stop();
@@ -487,6 +561,58 @@ script:
           id(${prefix}_poll_ok) = false;
           // Clear any stale partial JSON from interrupted previous transfer
           id(${prefix}_json_buf).clear();
+          // Push-only mode: after the first successful poll, stop polling
+          // entirely and rely on push notifications for live state. Matches
+          // what the official Sub-Zero Android app does on fw 8.5 (where
+          // the unlock session expires within ~1 minute and re-issuing
+          // unlock_channel doesn't refresh it - see APK research in
+          // docs/ble-protocol.adoc). Pushes still set poll_ok in the notify
+          // handler so zombie detection above keeps working; if 15 min of
+          // total silence ever happens, we'll reconnect normally.
+          //
+          // Three modes: "true" forces it on, "false" forces it off,
+          // "auto" (default) enables it whenever the parser sees
+          // `version.fw == "8.5"` in the first poll response.
+          {
+            const char *mode = "${push_only_after_first_poll}";
+            bool push_only =
+              (mode[0] == 't') ||  // "true"
+              (mode[0] == 'a' && id(${prefix}_fw_85_detected));  // "auto" + fw 8.5
+            if (push_only && id(${prefix}_first_poll_done)) {
+              return;
+            }
+          }
+          // Recovery ladder when poll_in_flight is still set from the
+          // previous tick (the previous get_async went unanswered):
+          //
+          //   Tick 1: run subscribe to re-issue unlock_channel + get_async.
+          //           Handles cold-boot races and most fw 8.5 unlock-expiry
+          //           cases - the unlock response is small (single fragment,
+          //           not ACL-vulnerable) so it parses cleanly as is_poll
+          //           and clears poll_in_flight + unanswered_polls.
+          //   Tick 2-3: same. Some sessions take a couple of refreshes.
+          //   Tick 4 (unanswered_polls >= 3): escalate to a full reconnect.
+          //           At this point the session is wedged at a level even
+          //           unlock_channel can't unstick - we never even saw the
+          //           unlock response come back across multiple retries.
+          //           auto_connect: true brings the connection back from
+          //           scratch. Counter resets on any valid is_poll parse.
+          if (id(${prefix}_poll_in_flight)) {
+            id(${prefix}_unanswered_polls) += 1;
+            if (id(${prefix}_unanswered_polls) >= 3) {
+              ESP_LOGW("szg", "[${appliance_name}] %d subscribe retries unanswered - session wedged, forcing reconnect",
+                id(${prefix}_unanswered_polls));
+              id(${prefix}_unanswered_polls) = 0;
+              id(${prefix}_poll_in_flight) = false;
+              id(${prefix}_debug).publish_state("Session wedged, reconnecting...");
+              client->disconnect();
+              return;
+            }
+            ESP_LOGW("szg", "[${appliance_name}] Previous poll unanswered (%d/3) - re-running subscribe to refresh session",
+              id(${prefix}_unanswered_polls));
+            id(${prefix}_subscribe).execute();
+            return;
+          }
           std::string cmd = "{\"cmd\":\"get_async\"}\n";
           esp_err_t err = esp_ble_gattc_write_char(
             client->get_gattc_if(), client->get_conn_id(),
@@ -498,6 +624,7 @@ script:
             client->disconnect();
             return;
           }
+          id(${prefix}_poll_in_flight) = true;
           ESP_LOGI("szg", "[${appliance_name}] Periodic poll (miss=%d, retries=%d)",
             id(${prefix}_poll_miss), id(${prefix}_fast_retries));
 
@@ -506,9 +633,19 @@ script:
   #    ESPHome's ble_client performs discovery once at connect and doesn't re-run it.
   # 2. We need to match D4/D5/D6/D7/D8 by UUID suffix and cache handles for fast reconnect.
   # 3. ESPHome does not expose GATT cache management (cache_refresh, cache_clean).
+  #
+  # The leading poll_offset delay staggers the bonding chain across multiple
+  # appliances on the same ESP32. Without it, three concurrent unlock_channel
+  # writes through the ESP-IDF Bluedroid stack at boot occasionally drop one,
+  # leaving that appliance with an unconfirmed unlock and silent get_async
+  # responses. Setting per-appliance poll_offset values like 0s/5s/10s
+  # serializes the bonding chains. periodic_poll has the same delay applied
+  # at its top, so the same stagger keeps the periodic polls themselves from
+  # colliding too.
   - id: ${prefix}_post_bond
     mode: restart
     then:
+      - delay: ${poll_offset}
       - delay: 500ms
       - lambda: |-
           auto *client = id(${prefix}_appliance);
@@ -660,6 +797,9 @@ script:
     mode: restart
     then:
       # Fast path: skip GATT dump, just encrypt + subscribe + unlock (no auto-poll)
+      # poll_offset stagger applies here too - simultaneous reconnects after a
+      # transient drop run into the same Bluedroid race as a fresh bond.
+      - delay: ${poll_offset}
       - lambda: |-
           auto *client = id(${prefix}_appliance);
           uint8_t addr[6];
@@ -745,4 +885,5 @@ script:
             d5, cmd.size(), (uint8_t*)cmd.data(),
             ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
           ESP_LOGI("ble", "[${appliance_name}] get_async err=%d", err);
+          if (err == ESP_OK) id(${prefix}_poll_in_flight) = true;
           id(${prefix}_debug).publish_state("Connected and polling.");

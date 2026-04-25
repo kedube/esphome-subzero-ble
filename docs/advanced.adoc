@@ -120,7 +120,7 @@ If you experience crashes (typically `__cxa_allocate_exception` -> `operator new
 [[reconnect-logic]]
 == Reconnect Logic
 
-The integration runs a periodic poll every 60 seconds against each bonded appliance, and uses one signal - total BLE silence - to decide when to force a reconnect.
+The integration runs a periodic poll every 60 seconds against each bonded appliance and uses two complementary mechanisms to keep things alive: zombie detection (catches a fully dead link) and a subscribe-retry safety net (catches a half-initialized session where the unlock_channel got dropped).
 
 === Zombie Detection
 
@@ -128,15 +128,76 @@ The integration runs a periodic poll every 60 seconds against each bonded applia
 
 This catches cases where the BLE link has died entirely. It intentionally does *not* try to distinguish "poll silently unanswered" from "appliance is quiet" - past attempts at a tighter signal caused pointless reconnect loops on fw 8.5 appliances whose polls sometimes fail to reassemble (see link:ble-protocol.adoc#_key_protocol_details[ACL Fragment Drops]) while pushes keep flowing.
 
+=== Subscribe Retry on Stale Unlock or Stuck Boot
+
+Two distinct conditions land the same appliance in the same state - bonded and connected at the GATT layer, but the command channel goes silent:
+
+1. **Cold-boot race.** When multiple appliances reconnect simultaneously at boot, the ESP-IDF Bluedroid stack occasionally drops one peer's `unlock_channel` write under the concurrent traffic. That appliance ends up subscribed and `get_async`-written at the BLE layer (status 0), but never responds because its session was never unlocked.
+
+2. **fw 8.5 unlock-session expiry.** Sub-Zero fridges and wall ovens running fw 8.5 / API 5.4 silently invalidate the unlock session within ~1 minute (much shorter than the 20-25 minute window observed on other firmware). After that, `get_async` writes on D5 are accepted at the BLE layer but produce no indication response, even though push notifications keep flowing.
+
+`poll_in_flight` is a per-appliance bool, cleared on disconnect, set to `true` whenever a `get_async` is written (in `subscribe` or `periodic_poll`), and cleared only by a valid poll response (`{"status":0,"resp":...}`, parser sets `is_poll=true`). Push notifications do **not** clear it - they prove the connection is alive but don't prove the command channel is responding.
+
+When `periodic_poll` fires and finds `poll_in_flight` still `true` from the previous tick, the previous poll went unanswered. Instead of writing another bare `get_async` into the void, it runs `_subscribe.execute()` - which re-writes CCCDs (idempotent), re-issues `unlock_channel`, and writes `get_async` again. The `unlock_channel` response is small (40 bytes, single fragment, not vulnerable to ACL drops) so it parses cleanly and clears `poll_in_flight`. Next tick takes the bare-poll path again.
+
+`unanswered_polls` is a small int counter that increments each time the subscribe-retry branch fires. It resets to 0 on any valid `is_poll` parse and on disconnect. When it reaches 3 (= 3 minutes of subscribe-retries that produced no poll response - not even an `unlock_channel` reply), the session is wedged at a level even subscribe can't unstick (we never even saw the unlock response come back). At that point the script calls `client->disconnect()` and `auto_connect: true` brings the connection back from scratch. This is intentionally faster than zombie detection (15 min) because zombie won't fire as long as pushes keep flowing.
+
+For the false-positive scenario the prior unlock-expiry detector hit (a push interleaving with a poll on fw 8.5 makes the poll's brace-balance never reach zero, so we never get an `is_poll=true` parse): re-running subscribe is the right response anyway. The unlock response on retry parses cleanly and clears the counter. We only escalate to reconnect if even unlock_channel goes silent - which is the genuinely-stuck case where reconnecting is correct.
+
+The `Log Debug Info` button on each appliance also calls `_subscribe.execute()` for the same reason: a bare `get_async` from the button doesn't work on a stale-unlock fw 8.5 appliance. Going through subscribe refreshes the session first.
+
+=== Boot Stagger via `poll_offset`
+
+`poll_offset` (substitution, default `0s`) is applied at the top of `periodic_poll`, `post_bond`, and `fast_reconnect`. Setting per-appliance values like `0s / 5s / 10s` on a multi-appliance ESP32 spreads the bonding chains in time so the concurrent-bonding race doesn't trigger in the first place. The subscribe-retry path above remains as a safety net.
+
+=== Push-Only Mode for fw 8.5 Appliances
+
+`push_only_after_first_poll` (substitution) controls whether the integration stops polling after the first successful response on each connect, relying on push notifications for live state. Three values:
+
+* `"auto"` *(default)* - decide at runtime from the firmware version reported in the first poll response. If the appliance reports `version.fw == "8.5"` (API 5.4), enable push-only mode for that connection. Otherwise leave it off. Sub-Zero 313 fridges, Wolf SO3050PESP wall ovens, and similar fw 8.5 / API 5.4 appliances are auto-detected and run in push-only mode without any per-appliance config. fw 2.27 / API 5.5 appliances stay on the standard 60s polling cadence.
+* `"true"` - always enable push-only after the first successful poll, regardless of detected firmware. Useful if you want the behavior on a fw 2.27 appliance to minimize BLE airtime.
+* `"false"` - never enable push-only. Use this to override the auto detection on a fw 8.5 appliance where you really want fresh `uptime` and `diagnostic_status` at the cost of the ~4 minute reconnect cycle the recovery ladder produces.
+
+When push-only is active, `periodic_poll` fires exactly once after each (re)connect to land an initial full state (sets `first_poll_done`), then returns early on every subsequent tick - no `get_async` writes, no subscribe-retry ladder. Push notifications carry live state and keep `poll_ok` set in the notify handler so zombie detection stays at zero unless 15 min of total silence happens. Poll-only fields (`appliance_model`, `appliance_serial`, version tree, `uptime`, `diagnostic_status`) refresh only on the next reconnect.
+
+This matches the strategy of the official Sub-Zero Android app (poll briefly, stop polling once async indications flow, rely on pushes thereafter - see link:ble-protocol.adoc#_unlock_session_research_fw_8_5[Unlock Session Research]).
+
+==== Trade-offs
+
+* **fw 8.5 with default `"auto"`**: connection stays up indefinitely if pushes are flowing (door opens, setpoint changes, light toggles, etc.), or until 15 min of total silence triggers zombie reconnect. No 4-min reconnect cycle. `uptime` only updates on reconnects - could be hours if the appliance is busy.
+* **fw 8.5 with `"false"`**: the recovery ladder kicks in (subscribe-retry × 3 → forced reconnect after 3 unanswered polls), so reconnects fire roughly every 4 minutes regardless of activity. `uptime` and `diagnostic_status` refresh on every cycle.
+* **fw 2.27 with default `"auto"`**: stays on the bare-poll fast path forever, just like before. Polls land every 60s, all sensors refresh every cycle.
+
+For fridge configurations using `poll_via_d4: "true"`, push-only is mostly moot since D4 polls don't need an unlock at all and never fail with the unlock-expiry symptom.
+
+Per-appliance override in your entry-point YAML:
+
+[source,yaml]
+----
+packages:
+  main_fridge: !include
+    file: subzero_fridge.yaml
+    vars:
+      prefix: "szg"
+      appliance_name: "Main Fridge"
+      appliance_mac: !secret main_fridge_mac
+      appliance_pin: !secret main_fridge_pin
+      push_only_after_first_poll: "false"   # override auto, keep polling
+----
+
 === Log Format
 
 [source]
 ----
 [I][szg:XXX]: [Left Dishwasher] Periodic poll (miss=2, retries=0)
+[W][szg:XXX]: [Wall Oven] Previous poll unanswered (1/3) - re-running subscribe to refresh session
+[W][szg:XXX]: [Wall Oven] 3 subscribe retries unanswered - session wedged, forcing reconnect
 ----
 
 * `miss` - zombie counter (0-15, reconnect at 15 = 15 min of total silence)
 * `retries` - fast-reconnect retry counter (0-3, bond clear at 3; see below)
+* `Previous poll unanswered (N/3)` - subscribe-retry path firing (poll_in_flight stayed `true` across a tick); on fw 8.5 appliances this is normal once per ~minute as the unlock session refreshes
+* `subscribe retries unanswered - session wedged` - escalation to reconnect after 3 subscribe-retries with no poll response
 
 === Fast Reconnect + Bond Clear
 
@@ -144,10 +205,9 @@ Separately, when the BLE connection drops and `auto_connect: true` reconnects, t
 
 === Tuning
 
-Both knobs are in `subzero_base.yaml`:
-
-* `interval: 60s` (line with `interval:`) - poll cadence. Shortening to 30s halves detection time and doubles radio utilization (still single-digit percent for typical configs).
+* `interval: 60s` in `subzero_base.yaml` - poll cadence. Shortening to 30s halves detection time and doubles radio utilization (still single-digit percent for typical configs).
 * `poll_miss >= 15` - zombie threshold. Scales with the interval: at 60s that's 15 min.
+* `poll_offset` substitution per-appliance - boot stagger. `0s` for first, `5s` or `10s` for subsequent appliances on the same ESP32.
 
 [[parser-component]]
 == Parser Component
@@ -200,30 +260,37 @@ Grep for `Response\[` and concatenate the payloads in order to reassemble the fu
 
 IMPORTANT: Debug-mode payload logging is intentionally gated behind the switch. Normal operation never logs raw BLE bytes, because any non-UTF-8 byte in a log message crashes Home Assistant's protobuf decoder (`LogEntryResponse` requires valid UTF-8) and HA caches the bad event into a restart loop. When debug mode IS on, bytes outside the printable-ASCII range are replaced with `?` as a safety net.
 
-The *Log Debug Info* button is a one-press shortcut: it turns on debug mode and immediately polls the appliance using the correct channel for that appliance type.
+The *Log Debug Info* button is a one-press shortcut: it turns on debug mode and lands a fresh poll. The path it takes depends on detected firmware:
+
+* **fw 2.27 / API 5.5**: re-runs the subscribe chain (CCCDs + `unlock_channel` + `get_async`) on the existing connection. Debug logs land in ~1.5 seconds.
+* **fw 8.5 / API 5.4**: forces a BLE disconnect. `auto_connect: true` brings the connection back via `post_bond` which naturally runs subscribe with a fresh unlock window. Debug logs land in ~10-15 seconds. Required because the fw 8.5 unlock session expires within ~1 minute and re-issuing `unlock_channel` on the existing connection produces no response (see link:ble-protocol.adoc#_unlock_session_research_fw_8_5[Unlock Session Research]).
+
+Either way the user-visible workflow is the same: press the button, wait, grep `Response\[` in the logs.
 
 === Dishwashers & Ranges
 
 Dishwashers and ranges respond to polls on the D5 (encrypted) channel with their full state - all sensor keys in a single response.
 
 . Press *Log Debug Info* (or turn on *Debug Mode* and press *Poll*).
+. Wait ~1.5s on fw 2.27 or ~10-15s on fw 8.5 for the poll to land.
 . Grep `Response\[` in the ESPHome logs, concatenate the chunks in order to get the full JSON.
 . Turn *Debug Mode* off when done.
 
 === Refrigerators / Freezers
 
-Fridges behave differently from dishwashers and ranges. They have 5 BLE characteristics (D4-D8) instead of 2 (D4-D5), and the command routing is different:
+Fridges have 5 BLE characteristics (D4-D8) instead of 2 (D4-D5):
 
-* *D4* (open channel) - responds to `get_async` with basic diagnostic data (model, doors, uptime), no unlock needed
-* *D5* (encrypted channel) - responds to `get_async` with the full appliance state after a fresh `unlock_channel`, but the unlock session expires after some time (possibly hours); push notifications continue regardless of session state
+* *D4* (open channel) - responds to `get_async` with basic diagnostic data (model, doors, uptime), no unlock needed; mirrors D5 push notifications with `msg_types: 8`
+* *D5* (encrypted channel) - responds to `get_async` with the full appliance state after a fresh `unlock_channel`; push notifications continue regardless of session state
 * *D6-D8* - accept writes but do not respond
 
-The *Log Debug Info* button polls D4, which always works without an unlock session. To capture the full set of keys from a fridge:
+The *Log Debug Info* button now uses the same path as ranges and dishwashers: subscribe-refresh on fw 2.27 (~1.5s), or force-reconnect on fw 8.5 (~10-15s). Either way you get a full D5 poll response logged as `Response[N/M]:` chunks. To capture the full set of keys including the live state changes:
 
-. Press *Log Debug Info* - this polls D4 and logs the basic diagnostic keys.
-. *Interact with the appliance* - open/close doors, change the set temperature on the panel, toggle the ice maker, etc. Each change triggers a push notification on D5 with the relevant keys, which debug mode captures and logs.
+. Press *Log Debug Info*.
+. Wait for the `Response[N/M]:` chunks - that's the full poll snapshot.
+. Optionally *interact with the appliance* (open/close doors, change set temp, toggle ice maker) to capture push notifications too. Each change triggers a small push on D5 with just the changed field.
 
-Between the D4 poll and D5 push notifications, you can map out every key your fridge exposes.
+Between the full D5 poll and D5 push notifications, you can map out every key your fridge exposes.
 
 === Reading the Logs
 

@@ -59,6 +59,10 @@ JsonObjectConst extract_data(JsonObjectConst root, bool &is_poll) {
     is_poll = false;
     return root["props"].as<JsonObjectConst>();
   }
+  if (root["msg_types"].is<int>() && root["msg_types"].as<int>() == 1) {
+    is_poll = false;
+    return root;
+  }
   return JsonObjectConst();
 }
 

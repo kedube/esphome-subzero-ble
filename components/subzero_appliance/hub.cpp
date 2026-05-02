@@ -7,7 +7,7 @@
 #include <cstring>
 #include <utility>
 
-#ifdef ESPHOME_LOG_HAS_INFO
+#ifdef USE_ESP32
 #include "esphome/core/log.h"
 #define HUB_LOGI(tag, ...) ESP_LOGI(tag, __VA_ARGS__)
 #define HUB_LOGW(tag, ...) ESP_LOGW(tag, __VA_ARGS__)
@@ -50,6 +50,7 @@ constexpr const char *kTimeoutSubscribeUnlock = "subscribe_unlock";
 constexpr const char *kTimeoutSubscribeGet = "subscribe_get";
 constexpr const char *kTimeoutFastReconnect = "fast_reconnect";
 constexpr const char *kTimeoutSubmitPinPoll = "submit_pin_poll";
+constexpr const char *kTimeoutVerbFallbackRetry = "verb_fallback_retry";
 } // namespace
 
 // =============================================================================
@@ -109,6 +110,7 @@ void SubzeroHub::handle_disconnected() {
   scheduler_->cancel_timeout(kTimeoutSubscribeGet);
   scheduler_->cancel_timeout(kTimeoutFastReconnect);
   scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
+  scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
@@ -154,11 +156,27 @@ std::uint32_t SubzeroHub::handle_passkey_request() {
 
 void SubzeroHub::handle_d5_notify(const std::uint8_t * /*data*/,
                                   std::size_t /*len*/) {
-  poll_ok_ = true;
+  // D5 indications are control-channel responses (display_pin /
+  // unlock_channel / set / scan acks) and duplicate copies of D6 push
+  // notifications — never poll responses. Setting poll_ok_=true here
+  // would mask the fw 8.5 silent-D6-poll case the same way D6 push
+  // traffic used to (the appliance keeps acking D5 commands AND
+  // mirroring D6 pushes onto D5 even when get_async on D6 has gone
+  // silent). poll_ok_ flips only in process_message_complete_ on a
+  // successful POLL RESPONSE — see CodeRabbit review on PR f795296.
+  // Body intentionally empty.
 }
 
 void SubzeroHub::handle_d6_notify(const std::uint8_t *data, std::size_t len) {
-  poll_ok_ = true;
+  // Don't set poll_ok_ here — push notifications on D6 (msg_types:1
+  // diagnostic_status, msg_types:2 props) would mask the fw 8.5
+  // silent-poll case where the appliance keeps pushing but never
+  // answers get_async. poll_ok_ is set in process_message_complete_
+  // only when a parsed message is a real POLL RESPONSE (status:0).
+  // The zombie detector then correctly forces a reconnect every ~3 min
+  // on fw 8.5, which is the only way to refresh full state on those
+  // devices (D6 unlock session expires server-side after ~60-80s of
+  // idle).
   if (json_buf_.feed(data, len)) {
     process_message_complete_();
   }
@@ -187,6 +205,8 @@ void SubzeroHub::process_message_complete_() {
           "Pairing required - press Start Pairing and re-enter PIN");
       return;
     }
+    if (handle_lacking_properties_(*msg))
+      return;
     HUB_LOGW("szg", "[%s] Parse failed or status!=0, skipping (%s...)",
              name_.c_str(),
              esphome::subzero_protocol::sanitize_for_log(
@@ -195,7 +215,49 @@ void SubzeroHub::process_message_complete_() {
     return;
   }
   fast_retries_ = 0;
-  poll_ok_ = true;
+  // poll_ok_ tracks specifically successful POLL RESPONSES (full state),
+  // not pushes. Setting it on incidental pushes (msg_types:1
+  // diagnostic_status, msg_types:2 props) would mask the fw 8.5
+  // silent-poll case — appliance keeps pushing but never answers
+  // get_async, so the zombie detector must still trigger a reconnect.
+  // has_status_value is whitespace-tolerant and digit-suffix-safe (won't
+  // false-match `"status":01` or `"status": 0` or `"status":09`).
+  if (esphome::subzero_protocol::has_status_value(*msg, '0')) {
+    poll_ok_ = true;
+  }
+}
+
+bool SubzeroHub::handle_lacking_properties_(const std::string &msg) {
+  if (!esphome::subzero_protocol::is_lacking_properties_response(msg))
+    return false;
+  if (poll_verb_ == esphome::subzero_protocol::PollVerb::kGetAsync) {
+    HUB_LOGW("szg",
+             "[%s] Appliance returned 'lacking properties' to get_async; "
+             "switching to {\"cmd\":\"get\"} fallback (verified working on "
+             "IR36550ST per issue #91; not a verb the official app sends "
+             "over BLE — see commands.h)",
+             name_.c_str());
+    poll_verb_ = esphome::subzero_protocol::PollVerb::kGet;
+    publish_status_("Switching to get fallback...");
+    if (scheduler_ != nullptr) {
+      scheduler_->set_timeout(kTimeoutVerbFallbackRetry,
+                              kVerbFallbackRetryDelayMs, [this]() {
+                                if (transport_ == nullptr || d6_handle_ == 0)
+                                  return;
+                                write_poll_command_(d6_handle_);
+                                publish_status_("Retrying with get...");
+                              });
+    }
+    return true;
+  }
+
+  HUB_LOGE("szg",
+           "[%s] Appliance returned 'lacking properties' to BOTH get_async "
+           "AND get; firmware does not support state polling. Push "
+           "notifications via CCCD may still work.",
+           name_.c_str());
+  publish_status_("Appliance does not support state polling");
+  return true;
 }
 
 void SubzeroHub::on_pin_confirmed_(const std::string &pin) {
@@ -205,6 +267,14 @@ void SubzeroHub::on_pin_confirmed_(const std::string &pin) {
     pin_input_cb_(pin);
   HUB_LOGI("szg", "[%s] PIN confirmed: %s", name_.c_str(), pin.c_str());
   publish_status_("PIN confirmed! Channel unlocked.");
+}
+
+void SubzeroHub::log_data_keys_(const std::vector<std::string> &keys) {
+  if (!debug_mode_)
+    return;
+  for (const auto &k : keys) {
+    HUB_LOGI("szg-debug", "[%s] key=%s", name_.c_str(), k.c_str());
+  }
 }
 
 void SubzeroHub::log_chunked_debug_(const std::string &msg) {
@@ -255,7 +325,7 @@ void SubzeroHub::do_periodic_poll() {
   if (!stored_pin_.empty()) {
     write_unlock_channel_(d6_handle_);
   }
-  std::string cmd = esphome::subzero_protocol::build_get_async();
+  std::string cmd = esphome::subzero_protocol::build_poll_command(poll_verb_);
   BleResult err = transport_->write(
       d6_handle_, reinterpret_cast<const std::uint8_t *>(cmd.data()),
       cmd.size());
@@ -266,7 +336,11 @@ void SubzeroHub::do_periodic_poll() {
     transport_->disconnect();
     return;
   }
-  HUB_LOGI("szg", "[%s] Periodic poll D6 (miss=%d, retries=%d)", name_.c_str(),
+  HUB_LOGI("szg", "[%s] Periodic poll D6 (verb=%s, miss=%d, retries=%d)",
+           name_.c_str(),
+           poll_verb_ == esphome::subzero_protocol::PollVerb::kGet
+               ? "get"
+               : "get_async",
            poll_miss_, fast_retries_);
 }
 
@@ -470,7 +544,7 @@ void SubzeroHub::subscribe_initial_get_() {
   if (d6_handle_ == 0)
     return;
   poll_ok_ = false;
-  write_get_async_(d6_handle_);
+  write_poll_command_(d6_handle_);
   publish_status_("Connected and polling.");
 }
 
@@ -511,9 +585,13 @@ void SubzeroHub::press_connect() {
     scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
     scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
     scheduler_->cancel_timeout(kTimeoutSubscribeGet);
+    scheduler_->cancel_timeout(kTimeoutFastReconnect);
+    scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
+    scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
   }
   post_bond_running_ = false;
   subscribe_running_ = false;
+  fast_reconnect_running_ = false;
 }
 
 void SubzeroHub::press_start_pairing() {
@@ -551,7 +629,7 @@ void SubzeroHub::press_submit_pin() {
                           [this]() {
                             if (d5_handle_ == 0)
                               return;
-                            write_get_async_(d5_handle_);
+                            write_poll_command_(d5_handle_);
                           });
 }
 
@@ -565,8 +643,11 @@ void SubzeroHub::press_poll() {
   if (!stored_pin_.empty()) {
     write_unlock_channel_(d6_handle_);
   }
-  write_get_async_(d6_handle_);
-  HUB_LOGI("ble", "[%s] POLL D6: re-unlock + get_async", name_.c_str());
+  write_poll_command_(d6_handle_);
+  HUB_LOGI("ble", "[%s] POLL D6: re-unlock + %s", name_.c_str(),
+           poll_verb_ == esphome::subzero_protocol::PollVerb::kGet
+               ? "get"
+               : "get_async");
   publish_status_("Polling...");
 }
 
@@ -587,12 +668,30 @@ void SubzeroHub::press_log_debug_info() {
 void SubzeroHub::press_reset_pairing() {
   if (transport_ == nullptr)
     return;
+  if (scheduler_ != nullptr) {
+    scheduler_->cancel_timeout(kTimeoutPostBondInitial);
+    scheduler_->cancel_timeout(kTimeoutPostBondPostEnc);
+    scheduler_->cancel_timeout(kTimeoutPostBondSearch);
+    scheduler_->cancel_timeout(kTimeoutPostBondPoll1);
+    scheduler_->cancel_timeout(kTimeoutPostBondPoll2);
+    scheduler_->cancel_timeout(kTimeoutPostBondPoll3);
+    scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
+    scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
+    scheduler_->cancel_timeout(kTimeoutSubscribeGet);
+    scheduler_->cancel_timeout(kTimeoutFastReconnect);
+    scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
+    scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
+  }
   pin_confirmed_ = false;
   clear_handles_();
   phase_ = 0;
   fast_retries_ = 0;
   poll_miss_ = 0;
   json_buf_.clear();
+  poll_verb_ = esphome::subzero_protocol::PollVerb::kGetAsync;
+  post_bond_running_ = false;
+  subscribe_running_ = false;
+  fast_reconnect_running_ = false;
   transport_->cache_clean();
   transport_->remove_bond();
   HUB_LOGW("ble", "[%s] Bond removed, GATT cache cleared, all state reset",
@@ -640,12 +739,12 @@ void SubzeroHub::write_unlock_channel_(std::uint16_t handle) {
                     cmd.size());
 }
 
-void SubzeroHub::write_get_async_(std::uint16_t handle) {
+void SubzeroHub::write_poll_command_(std::uint16_t handle) {
   if (transport_ == nullptr)
     return;
   if (handle == 0)
     return;
-  std::string cmd = esphome::subzero_protocol::build_get_async();
+  std::string cmd = esphome::subzero_protocol::build_poll_command(poll_verb_);
   transport_->write(handle, reinterpret_cast<const std::uint8_t *>(cmd.data()),
                     cmd.size());
 }

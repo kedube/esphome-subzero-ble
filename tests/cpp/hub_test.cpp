@@ -6,12 +6,11 @@
 // advanced via FakeScheduler::advance_to().
 
 #include "../../components/subzero_appliance/hub.h"
-
 #include "hub_test_helpers.h"
-
-#include <gtest/gtest.h>
-
+#include "protocol.h"
+#include <algorithm>
 #include <cstring>
+#include <gtest/gtest.h>
 #include <string>
 #include <vector>
 
@@ -376,10 +375,12 @@ TEST_F(HubFixture, PeriodicPoll_ZombieDetection_ReconnectsAfterThreeMisses) {
 // Notify + parse path
 // =============================================================================
 
-TEST_F(HubFixture, D5Notify_OnlyResetsZombieFlag) {
+TEST_F(HubFixture, D5Notify_DoesNotTouchPollOkOrBuffer) {
   std::uint8_t bytes[] = {'p', 'u', 's', 'h'};
   hub_.handle_d5_notify(bytes, sizeof(bytes));
-  EXPECT_TRUE(hub_.poll_ok());
+  EXPECT_FALSE(hub_.poll_ok())
+      << "D5 indications must not flip poll_ok_ — only successful POLL "
+         "RESPONSES on D6 (status:0) reset the zombie counter.";
   // D5 must NOT trigger parse_and_dispatch_ — buffer is for D6 only.
   EXPECT_FALSE(hub_.parse_called_);
 }
@@ -589,4 +590,278 @@ TEST_F(HubFixture, PostBondRestart_CancelsPriorPostBond) {
   // We can't easily assert "exactly one timeout pending", but at minimum
   // the hub must not have rescheduled multiple competing chains.
   EXPECT_LE(scheduler_.pending_count(), pending_before + 1);
+}
+
+namespace {
+
+class RecordingFridgeLikeHub : public SubzeroHub {
+public:
+  RecordingFridgeLikeHub() = default;
+  bool parse_and_dispatch_(const std::string &msg) override {
+    auto s = esphome::subzero_protocol::parse_fridge(msg);
+    if (!s.valid)
+      return false;
+    log_data_keys_(s.data_keys);
+    return true;
+  }
+
+  void log_data_keys_(const std::vector<std::string> &keys) override {
+    log_calls_.push_back(keys);
+  }
+
+  std::vector<std::vector<std::string>> log_calls_;
+};
+
+class FridgeLikeFixture : public ::testing::Test {
+protected:
+  RecordingFridgeLikeHub hub_;
+};
+
+} // namespace
+
+TEST_F(FridgeLikeFixture, ParseAndDispatch_InvokesLogDataKeysWithParsedKeys) {
+  const std::string msg =
+      R"({"status":0,"resp":{"sabbath_on":false,"ref_set_temp":38,"appliance_model":"DEU2450R"}})";
+
+  bool ok = hub_.parse_and_dispatch_(msg);
+  ASSERT_TRUE(ok);
+
+  ASSERT_EQ(hub_.log_calls_.size(), 1u)
+      << "Subclass parse_and_dispatch_ must call log_data_keys_ exactly "
+         "once per successful parse — if this fires 0 times, the subclass "
+         "dropped the call (regression of the Phase 3 port).";
+
+  const auto &keys = hub_.log_calls_.front();
+  EXPECT_NE(std::find(keys.begin(), keys.end(), "sabbath_on"), keys.end());
+  EXPECT_NE(std::find(keys.begin(), keys.end(), "ref_set_temp"), keys.end());
+  EXPECT_NE(std::find(keys.begin(), keys.end(), "appliance_model"), keys.end());
+  EXPECT_EQ(keys.size(), 3u)
+      << "log_data_keys_ should receive the full data_keys vector from "
+         "the parser, not a subset.";
+}
+
+TEST_F(FridgeLikeFixture, ParseAndDispatch_DoesNotInvokeLogOnParseFailure) {
+  bool ok = hub_.parse_and_dispatch_("not json at all");
+  EXPECT_FALSE(ok);
+  EXPECT_EQ(hub_.log_calls_.size(), 0u);
+}
+
+namespace {
+
+class GuardSpyHub : public SubzeroHub {
+public:
+  bool parse_and_dispatch_(const std::string &) override { return true; }
+  void log_data_keys_(const std::vector<std::string> &keys) override {
+    invocations_++;
+    SubzeroHub::log_data_keys_(keys); // exercises the debug_mode_ guard
+  }
+  int invocations_ = 0;
+};
+
+} // namespace
+
+TEST(SubzeroHubLogDataKeys, NoDebugMode_GuardLetsBaseNoOp) {
+  GuardSpyHub h;
+  h.log_data_keys_({"a", "b", "c"});
+  EXPECT_EQ(h.invocations_, 1);
+}
+
+TEST(SubzeroHubLogDataKeys, DebugModeOn_BaseCompletesWithoutError) {
+  GuardSpyHub h;
+  h.set_debug_mode(true);
+  h.log_data_keys_({"a", "b"});
+  EXPECT_EQ(h.invocations_, 1);
+}
+
+namespace {
+
+// 56-byte sentinel from the user's IR36550ST in issue #91.
+constexpr const char *kLackingPropertiesSentinel =
+    "{\"status\":1,\"resp\":{},\"status_msg\":\"An error occurred\"}\n";
+
+void feed_message(SubzeroHub &hub, const std::string &payload) {
+  hub.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(payload.data()),
+                       payload.size());
+}
+
+} // namespace
+
+TEST_F(HubFixture, PollVerb_DefaultsToGetAsync) {
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGetAsync);
+}
+
+TEST_F(HubFixture, LackingProperties_FlipsVerbAndSchedulesRetry) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  ASSERT_GT(hub_.d6_handle(), 0);
+
+  hub_.parse_should_succeed_ = false;
+  std::size_t writes_before = transport_.write_count();
+
+  feed_message(hub_, kLackingPropertiesSentinel);
+
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGet);
+  EXPECT_TRUE(any_status_contains("get"));
+  EXPECT_EQ(transport_.write_count(), writes_before)
+      << "Retry must be deferred via scheduler — not written inline.";
+  scheduler_.advance_by(1100); // > kVerbFallbackRetryDelayMs (1000)
+  EXPECT_TRUE(transport_.wrote_command_to(hub_.d6_handle(), "\"get\"}"))
+      << "After the verb-fallback retry timer fires, hub must write "
+         "{\"cmd\":\"get\"} to D6 (the verb empirically confirmed working "
+         "on IR36550ST per issue #91).";
+}
+
+TEST_F(HubFixture, LackingProperties_LatchesOnGet) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  hub_.parse_should_succeed_ = false;
+  feed_message(hub_, kLackingPropertiesSentinel);
+  ASSERT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGet);
+  scheduler_.advance_by(1100);
+  transport_.clear_writes();
+  hub_.parse_should_succeed_ = true;
+  feed_message(hub_, "{\"status\":0,\"resp\":{\"ref_set_temp\":38}}\n");
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGet);
+
+  // Subsequent periodic_poll must use get, not get_async.
+  hub_.do_periodic_poll();
+  EXPECT_TRUE(transport_.wrote_command_to(hub_.d6_handle(), "\"get\"}"));
+  EXPECT_FALSE(transport_.wrote_command_to(hub_.d6_handle(), "get_async"))
+      << "After latching, periodic poll must use get exclusively.";
+}
+
+TEST_F(HubFixture, LackingProperties_SecondHitDoesNotPingPongVerb) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.parse_should_succeed_ = false;
+
+  feed_message(hub_, kLackingPropertiesSentinel);
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGet);
+  scheduler_.advance_by(1100);
+
+  // Second hit — `get` also failed.
+  feed_message(hub_, kLackingPropertiesSentinel);
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGet)
+      << "Verb must stay at kGet on repeated sentinel responses — no "
+         "ping-pong back to kGetAsync.";
+}
+
+TEST_F(HubFixture, ResetPairing_RestoresDefaultVerb) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.set_poll_verb(esphome::subzero_protocol::PollVerb::kGet);
+
+  hub_.press_reset_pairing();
+  EXPECT_EQ(hub_.poll_verb(), esphome::subzero_protocol::PollVerb::kGetAsync);
+}
+
+TEST_F(HubFixture, PeriodicPoll_UsesCurrentVerb) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  transport_.clear_writes();
+
+  hub_.do_periodic_poll();
+  EXPECT_TRUE(transport_.wrote_command_to(hub_.d6_handle(), "get_async"));
+
+  hub_.set_poll_verb(esphome::subzero_protocol::PollVerb::kGet);
+  transport_.clear_writes();
+  hub_.do_periodic_poll();
+  EXPECT_TRUE(transport_.wrote_command_to(hub_.d6_handle(), "\"get\"}"));
+}
+
+namespace {
+
+// Helper: feed a fully-formed JSON string + trailing newline through the
+// D6 indication path so json_buf_ can detect message completion.
+void feed_complete_d6_(SubzeroHub &hub, const std::string &payload) {
+  std::string with_newline = payload + "\n";
+  hub.handle_d6_notify(
+      reinterpret_cast<const std::uint8_t *>(with_newline.data()),
+      with_newline.size());
+}
+
+} // namespace
+
+TEST_F(HubFixture, PollOk_NotSetByMsgTypes2Push) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  // After run_to_ready_, subscribe_initial_get_ has set poll_ok_=false
+  // and written get_async. One do_periodic_poll cycle takes miss to 1.
+  hub_.do_periodic_poll();
+  ASSERT_EQ(hub_.poll_miss(), 1);
+
+  // Feed a msg_types:2 push. With the fix, poll_ok_ stays false because
+  // the push has no "status":0.
+  hub_.parse_should_succeed_ = true;
+  feed_complete_d6_(hub_,
+                    R"({"seq":1,"msg_types":2,"props":{"door_ajar":true}})");
+
+  // Next periodic_poll must increment miss (push did NOT reset poll_ok_).
+  hub_.do_periodic_poll();
+  EXPECT_EQ(hub_.poll_miss(), 2)
+      << "poll_miss_ must NOT reset on a msg_types:2 push — only real "
+         "poll responses (status:0) reset the zombie counter. fw 8.5 "
+         "silent-poll detection depends on this.";
+}
+
+TEST_F(HubFixture, PollOk_NotSetByMsgTypes1Push) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.do_periodic_poll();
+  ASSERT_EQ(hub_.poll_miss(), 1);
+
+  hub_.parse_should_succeed_ = true;
+  feed_complete_d6_(hub_,
+                    R"({"diagnostic_status":"0x123","msg_types":1,"seq":1})");
+
+  hub_.do_periodic_poll();
+  EXPECT_EQ(hub_.poll_miss(), 2)
+      << "msg_types:1 diagnostic_status pushes must NOT reset the zombie "
+         "counter — fw 8.5 wall ovens emit these continuously while "
+         "get_async goes silent (live log 2026-05-01, issue #91 thread).";
+}
+
+TEST_F(HubFixture, PollOk_SetByActualPollResponse) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.do_periodic_poll();
+  ASSERT_EQ(hub_.poll_miss(), 1)
+      << "Test setup: needs poll_miss_ > 0 before feeding the response.";
+
+  hub_.parse_should_succeed_ = true;
+  // Real poll response: status:0 — must reset the zombie counter.
+  feed_complete_d6_(hub_, R"({"status":0,"resp":{"ref_set_temp":38}})");
+
+  hub_.do_periodic_poll();
+  EXPECT_EQ(hub_.poll_miss(), 0)
+      << "poll_miss_ must reset to 0 once a real poll response arrives.";
+}
+
+TEST_F(HubFixture, ZombieDetector_StillFiresWithPushTraffic) {
+  // Direct integration test for the live-log scenario from the issue
+  // #91 thread (Wall Oven SO3050PESP fw 8.5): appliance keeps pushing
+  // msg_types:1 every minute but never answers get_async. The zombie
+  // detector must still trip after 3 silent polls and force a reconnect
+  // — otherwise the appliance state stays frozen on its initial poll
+  // values forever.
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.parse_should_succeed_ = true;
+  std::size_t disc_before = transport_.disconnect_count();
+
+  // Cycle 1: poll fails silently, then push arrives (poll_ok_ stays false)
+  hub_.do_periodic_poll();
+  feed_complete_d6_(hub_,
+                    R"({"diagnostic_status":"0x1","msg_types":1,"seq":1})");
+  // Cycle 2: poll fails silently, push arrives
+  hub_.do_periodic_poll();
+  feed_complete_d6_(hub_,
+                    R"({"diagnostic_status":"0x2","msg_types":1,"seq":2})");
+  // Cycle 3: poll fails silently → miss hits threshold → ZOMBIE FIRES
+  hub_.do_periodic_poll();
+  EXPECT_GT(transport_.disconnect_count(), disc_before)
+      << "Zombie detector must force a reconnect after 3 silent polls "
+         "even when push notifications keep arriving — otherwise the "
+         "fw 8.5 silent-poll case never recovers.";
 }

@@ -354,6 +354,39 @@ TEST(ProtocolTest, IsPollAcrossAllThreeParsers) {
   EXPECT_FALSE(parse_range(R"({"seq":1,"props":{},"msg_types":2})").is_poll);
 }
 
+TEST(ProtocolTest, MsgTypes1PushExtractsDiagnosticStatus) {
+  const std::string msg =
+      R"({"diagnostic_status":"0x00000301111","msg_types":1,)"
+      R"("seq":475,"timestamp":"2026-05-01T23:08:02-05:00"})";
+  auto f = parse_fridge(msg);
+  ASSERT_TRUE(f.valid);
+  EXPECT_FALSE(f.is_poll);
+  ASSERT_TRUE(f.common.diagnostic_status.has_value());
+  EXPECT_EQ(*f.common.diagnostic_status, "0x00000301111");
+}
+
+TEST(ProtocolTest, MsgTypes1PushAcrossAllParsers) {
+  const std::string msg =
+      R"({"diagnostic_status":"0x12345","msg_types":1,"seq":1})";
+  auto f = parse_fridge(msg);
+  auto d = parse_dishwasher(msg);
+  auto r = parse_range(msg);
+
+  ASSERT_TRUE(f.valid);
+  ASSERT_TRUE(d.valid);
+  ASSERT_TRUE(r.valid);
+  EXPECT_FALSE(f.is_poll);
+  EXPECT_FALSE(d.is_poll);
+  EXPECT_FALSE(r.is_poll);
+
+  ASSERT_TRUE(f.common.diagnostic_status.has_value());
+  ASSERT_TRUE(d.common.diagnostic_status.has_value());
+  ASSERT_TRUE(r.common.diagnostic_status.has_value());
+  EXPECT_EQ(*f.common.diagnostic_status, "0x12345");
+  EXPECT_EQ(*d.common.diagnostic_status, "0x12345");
+  EXPECT_EQ(*r.common.diagnostic_status, "0x12345");
+}
+
 TEST(ProtocolTest, DataKeysCapturedInOrder) {
   auto f = parse_fridge(
       R"({"status":0,"resp":{"ref_set_temp":38,"ice_maker_on":true,"appliance_model":"2028"}})");

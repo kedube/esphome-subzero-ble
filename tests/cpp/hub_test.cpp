@@ -36,6 +36,14 @@ public:
     if (parse_should_confirm_pin_) {
       on_pin_confirmed_(pin_to_confirm_);
     }
+    if (parse_should_succeed_) {
+      // Mirror the real subclasses' contract: derive is_poll from the
+      // parser and report it via note_poll_response_(). The base hub
+      // uses this (instead of re-scanning the buffer) to set poll_ok_,
+      // so the zombie-counter tests exercise the production code path.
+      auto s = esphome::subzero_protocol::parse_fridge(msg);
+      note_poll_response_(s.is_poll);
+    }
     return parse_should_succeed_;
   }
 

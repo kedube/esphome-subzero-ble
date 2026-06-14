@@ -20,9 +20,10 @@ public:
 
 protected:
   bool parse_and_dispatch_(const std::string &msg) override {
-    auto s = esphome::subzero_protocol::parse_dishwasher(msg);
+    auto s = esphome::subzero_protocol::parse_dishwasher(msg, debug_mode());
     if (!s.valid)
       return false;
+    note_poll_response_(s.is_poll);
     log_data_keys_(s.data_keys);
     if (s.common.pin_confirmed) {
       on_pin_confirmed_(*s.common.pin_confirmed);

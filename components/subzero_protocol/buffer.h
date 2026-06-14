@@ -98,7 +98,12 @@ public:
       clear();
       return std::nullopt;
     }
-    std::string out = (start == 0) ? std::move(buf_) : buf_.substr(start);
+    // Copy out (rather than move) so buf_'s reserved capacity survives the
+    // reset — moving would leave buf_ empty with capacity 0, forcing the
+    // kReserveHint reserve to reallocate the ~2KB buffer on every poll
+    // (~1,440x/day), which churns and fragments the ESP32 heap. clear()
+    // keeps the existing allocation for the next message.
+    std::string out(buf_, start);
     clear();
     return out;
   }

@@ -100,19 +100,7 @@ void SubzeroHub::handle_disconnected() {
   if (transport_ == nullptr || scheduler_ == nullptr)
     return;
   json_buf_.clear();
-  scheduler_->cancel_timeout(kTimeoutPostBondInitial);
-  scheduler_->cancel_timeout(kTimeoutPostBondPostEnc);
-  scheduler_->cancel_timeout(kTimeoutPostBondSearch);
-  scheduler_->cancel_timeout(kTimeoutPostBondPoll1);
-  scheduler_->cancel_timeout(kTimeoutPostBondPoll2);
-  scheduler_->cancel_timeout(kTimeoutPostBondPoll3);
-  scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
-  scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
-  scheduler_->cancel_timeout(kTimeoutSubscribeGet);
-  scheduler_->cancel_timeout(kTimeoutFastReconnect);
-  scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
-  scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
-  scheduler_->cancel_timeout(kTimeoutSessionRefresh);
+  cancel_all_timeouts_();
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
@@ -190,6 +178,10 @@ void SubzeroHub::process_message_complete_() {
   if (debug_mode_)
     log_chunked_debug_(*msg);
 
+  // Cleared before the parse; the subclass calls note_poll_response_() with
+  // State::is_poll on the success path, so we can set poll_ok_ below without
+  // a second full-buffer scan via has_status_value().
+  last_was_status0_poll_ = false;
   bool ok = parse_and_dispatch_(*msg);
   if (!ok) {
     if (msg->find("\"status\":302") != std::string::npos) {
@@ -212,7 +204,10 @@ void SubzeroHub::process_message_complete_() {
     return;
   }
   fast_retries_ = 0;
-  if (esphome::subzero_protocol::has_status_value(*msg, '0')) {
+  // is_poll is set by the parser only when the message was a status:0 poll
+  // response (extract_data), which is exactly what the old
+  // has_status_value(*msg, '0') scan detected — minus the rescan.
+  if (last_was_status0_poll_) {
     poll_ok_ = true;
   }
 }
@@ -303,7 +298,8 @@ void SubzeroHub::do_periodic_poll() {
   if (!stored_pin_.empty()) {
     write_unlock_channel_(d6_handle_);
   }
-  std::string cmd = esphome::subzero_protocol::build_poll_command(poll_verb_);
+  const std::string &cmd =
+      esphome::subzero_protocol::build_poll_command(poll_verb_);
   BleResult err = transport_->write(
       d6_handle_, reinterpret_cast<const std::uint8_t *>(cmd.data()),
       cmd.size());
@@ -582,21 +578,7 @@ void SubzeroHub::press_connect() {
   phase_ = 0;
   clear_handles_();
   json_buf_.clear();
-  if (scheduler_ != nullptr) {
-    scheduler_->cancel_timeout(kTimeoutPostBondInitial);
-    scheduler_->cancel_timeout(kTimeoutPostBondPostEnc);
-    scheduler_->cancel_timeout(kTimeoutPostBondSearch);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll1);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll2);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll3);
-    scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
-    scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
-    scheduler_->cancel_timeout(kTimeoutSubscribeGet);
-    scheduler_->cancel_timeout(kTimeoutFastReconnect);
-    scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
-    scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
-    scheduler_->cancel_timeout(kTimeoutSessionRefresh);
-  }
+  cancel_all_timeouts_();
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
@@ -676,21 +658,7 @@ void SubzeroHub::press_log_debug_info() {
 void SubzeroHub::press_reset_pairing() {
   if (transport_ == nullptr)
     return;
-  if (scheduler_ != nullptr) {
-    scheduler_->cancel_timeout(kTimeoutPostBondInitial);
-    scheduler_->cancel_timeout(kTimeoutPostBondPostEnc);
-    scheduler_->cancel_timeout(kTimeoutPostBondSearch);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll1);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll2);
-    scheduler_->cancel_timeout(kTimeoutPostBondPoll3);
-    scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
-    scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
-    scheduler_->cancel_timeout(kTimeoutSubscribeGet);
-    scheduler_->cancel_timeout(kTimeoutFastReconnect);
-    scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
-    scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
-    scheduler_->cancel_timeout(kTimeoutSessionRefresh);
-  }
+  cancel_all_timeouts_();
   pin_confirmed_ = false;
   clear_handles_();
   phase_ = 0;
@@ -725,6 +693,24 @@ void SubzeroHub::publish_status_(const std::string &text) {
     status_cb_(text);
 }
 
+void SubzeroHub::cancel_all_timeouts_() {
+  if (scheduler_ == nullptr)
+    return;
+  scheduler_->cancel_timeout(kTimeoutPostBondInitial);
+  scheduler_->cancel_timeout(kTimeoutPostBondPostEnc);
+  scheduler_->cancel_timeout(kTimeoutPostBondSearch);
+  scheduler_->cancel_timeout(kTimeoutPostBondPoll1);
+  scheduler_->cancel_timeout(kTimeoutPostBondPoll2);
+  scheduler_->cancel_timeout(kTimeoutPostBondPoll3);
+  scheduler_->cancel_timeout(kTimeoutPostBondGiveup);
+  scheduler_->cancel_timeout(kTimeoutSubscribeUnlock);
+  scheduler_->cancel_timeout(kTimeoutSubscribeGet);
+  scheduler_->cancel_timeout(kTimeoutFastReconnect);
+  scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
+  scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
+  scheduler_->cancel_timeout(kTimeoutSessionRefresh);
+}
+
 void SubzeroHub::clear_handles_() {
   d5_handle_ = 0;
   d6_handle_ = 0;
@@ -753,7 +739,8 @@ void SubzeroHub::write_poll_command_(std::uint16_t handle) {
     return;
   if (handle == 0)
     return;
-  std::string cmd = esphome::subzero_protocol::build_poll_command(poll_verb_);
+  const std::string &cmd =
+      esphome::subzero_protocol::build_poll_command(poll_verb_);
   transport_->write(handle, reinterpret_cast<const std::uint8_t *>(cmd.data()),
                     cmd.size());
 }

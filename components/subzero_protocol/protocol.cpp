@@ -42,7 +42,7 @@ std::optional<float> opt_float(JsonVariantConst v) {
 
 // Returns the data object (resp for polls, props for pushes) and sets is_poll.
 // Returns a null object if the format is unrecognized or status != 0.
-void capture_keys(JsonObjectConst data, std::vector<std::string> &out) {
+void collect_keys(JsonObjectConst data, std::vector<std::string> &out) {
   for (JsonPairConst kv : data) {
     out.emplace_back(kv.key().c_str());
   }
@@ -214,7 +214,7 @@ std::optional<int> minutes_between(const char *now_iso,
 
 } // namespace
 
-FridgeState parse_fridge(const std::string &json) {
+FridgeState parse_fridge(const std::string &json, bool capture_keys) {
   FridgeState state;
   JsonDocument doc;
   if (deserializeJson(doc, json))
@@ -241,7 +241,8 @@ FridgeState parse_fridge(const std::string &json) {
   state.valid = true;
   state.is_poll = is_poll;
   state.notif_event = std::move(notif_event);
-  capture_keys(data, state.data_keys);
+  if (capture_keys)
+    collect_keys(data, state.data_keys);
   fill_common(data, state.common);
 
   state.ref_set_temp = opt_float(data["ref_set_temp"]);
@@ -281,7 +282,7 @@ FridgeState parse_fridge(const std::string &json) {
   return state;
 }
 
-DishwasherState parse_dishwasher(const std::string &json) {
+DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
   DishwasherState state;
   JsonDocument doc;
   if (deserializeJson(doc, json))
@@ -303,7 +304,8 @@ DishwasherState parse_dishwasher(const std::string &json) {
   state.valid = true;
   state.is_poll = is_poll;
   state.notif_event = std::move(notif_event);
-  capture_keys(data, state.data_keys);
+  if (capture_keys)
+    collect_keys(data, state.data_keys);
   fill_common(data, state.common);
 
   state.door_ajar = opt_bool(data["door_ajar"]);
@@ -336,7 +338,7 @@ DishwasherState parse_dishwasher(const std::string &json) {
   return state;
 }
 
-RangeState parse_range(const std::string &json) {
+RangeState parse_range(const std::string &json, bool capture_keys) {
   RangeState state;
   JsonDocument doc;
   if (deserializeJson(doc, json))
@@ -358,7 +360,8 @@ RangeState parse_range(const std::string &json) {
   state.valid = true;
   state.is_poll = is_poll;
   state.notif_event = std::move(notif_event);
-  capture_keys(data, state.data_keys);
+  if (capture_keys)
+    collect_keys(data, state.data_keys);
   fill_common(data, state.common);
 
   // Door with generic fallback.

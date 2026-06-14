@@ -172,6 +172,15 @@ protected:
   // CommonFields contains pin_confirmed. The hub updates stored_pin_
   // and pin_confirmed_, then notifies via pin_input_cb_.
   void on_pin_confirmed_(const std::string &pin);
+
+  // Subclass hook — record whether the just-parsed message was a status:0
+  // poll response (State::is_poll). The base consumes this to set poll_ok_
+  // instead of re-scanning the whole JSON buffer with has_status_value()
+  // after the parser already determined the status. Call from
+  // parse_and_dispatch_() on the success path, passing State::is_poll.
+  void note_poll_response_(bool is_status0_poll) {
+    last_was_status0_poll_ = is_status0_poll;
+  }
   // Virtual so host tests can spy on the subclass call contract
   virtual void log_data_keys_(const std::vector<std::string> &keys);
 
@@ -199,6 +208,11 @@ private:
 
   // ---- helpers ----
   void publish_status_(const std::string &text);
+  // Cancels every scheduler timeout this hub can arm. Called from the
+  // three teardown paths (handle_disconnected / press_connect /
+  // press_reset_pairing) so the timeout-name list lives in exactly one
+  // place — adding a new timeout means updating only this method.
+  void cancel_all_timeouts_();
   void clear_handles_();
   void clear_session_state_();
   void process_message_complete_();
@@ -226,6 +240,11 @@ private:
   std::string stored_pin_;
   bool pin_confirmed_ = true; // matches YAML's restore_value:true initial
   bool poll_ok_ = false;
+  // Set by note_poll_response_() during parse_and_dispatch_(); read once in
+  // process_message_complete_() to set poll_ok_ without re-scanning the
+  // buffer. Reset to false before each parse so a non-poll push doesn't
+  // leave a stale true behind.
+  bool last_was_status0_poll_ = false;
   int fast_retries_ = 0;
   int poll_miss_ = 0;
   bool debug_mode_ = false;

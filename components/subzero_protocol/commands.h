@@ -55,15 +55,24 @@ inline std::string build_unlock_channel(const std::string &pin) {
          detail::escape_json_string(pin) + "\"}}\n";
 }
 
-inline std::string build_get_async() { return "{\"cmd\":\"get_async\"}\n"; }
-inline std::string build_get() { return "{\"cmd\":\"get\"}\n"; }
+// The two poll verbs have constant payloads and are written on every 60s
+// poll cycle. Return references to function-local statics so the hot path
+// reuses one allocation instead of building a fresh std::string each tick.
+inline const std::string &build_get_async() {
+  static const std::string kGetAsync = "{\"cmd\":\"get_async\"}\n";
+  return kGetAsync;
+}
+inline const std::string &build_get() {
+  static const std::string kGet = "{\"cmd\":\"get\"}\n";
+  return kGet;
+}
 
 enum class PollVerb {
   kGetAsync,
   kGet,
 };
 
-inline std::string build_poll_command(PollVerb v) {
+inline const std::string &build_poll_command(PollVerb v) {
   return v == PollVerb::kGet ? build_get() : build_get_async();
 }
 

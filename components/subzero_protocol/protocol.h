@@ -136,9 +136,16 @@ struct RangeState {
   std::optional<float> cav2_probe_set_temp;
 };
 
-FridgeState parse_fridge(const std::string &json);
-DishwasherState parse_dishwasher(const std::string &json);
-RangeState parse_range(const std::string &json);
+// `capture_keys` controls whether the data object's top-level key names are
+// collected into State::data_keys. That collection allocates a vector plus a
+// std::string per key on every parse, but the keys are only ever consumed by
+// the hub's debug-mode logging. Production passes the hub's debug_mode_ flag
+// so the allocation is skipped on the hot poll path; it defaults to true so
+// the parser tests (which assert on data_keys) keep working unchanged.
+FridgeState parse_fridge(const std::string &json, bool capture_keys = true);
+DishwasherState parse_dishwasher(const std::string &json,
+                                 bool capture_keys = true);
+RangeState parse_range(const std::string &json, bool capture_keys = true);
 
 } // namespace subzero_protocol
 } // namespace esphome

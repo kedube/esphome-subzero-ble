@@ -90,17 +90,21 @@ public:
     std::vector<GattDbEntry> out;
     if (client_ == nullptr)
       return out;
-    // Ask the stack for the attribute count first, then heap-allocate the
-    // element array. The previous fixed esp_gattc_db_elem_t db[64] burned
-    // ~2KB of the shared main-loop stack per call and silently truncated
-    // GATT databases with more than 64 attributes.
-    std::uint16_t count = 0;
-    esp_ble_gattc_get_attr_count(client_->get_gattc_if(),
-                                 client_->get_conn_id(), ESP_GATT_DB_ALL,
-                                 0x0001, 0xFFFF, /*char_handle=*/0, &count);
-    if (count == 0)
-      return out;
-    std::vector<esp_gattc_db_elem_t> db(count);
+    // Single snapshot read with the element array on the heap — the old
+    // fixed esp_gattc_db_elem_t db[64] burned ~2KB of the shared
+    // main-loop stack per call. Capacity is 128 (double the old cap) for
+    // headroom on large GATT tables.
+    //
+    // Deliberately NOT sized via esp_ble_gattc_get_attr_count(): the BTA
+    // task fills the service cache asynchronously (post cache_refresh /
+    // search_service), so a count-then-copy pair can capture a stale
+    // smaller count and truncate the copy below the D5 characteristic.
+    // One call, one snapshot, matching the original battle-tested
+    // behavior — the exact-sizing "optimization" only saves a transient
+    // ~4KB heap allocation during discovery, not worth the race window.
+    constexpr std::uint16_t kMaxDbEntries = 128;
+    std::vector<esp_gattc_db_elem_t> db(kMaxDbEntries);
+    std::uint16_t count = kMaxDbEntries;
     esp_ble_gattc_get_db(client_->get_gattc_if(), client_->get_conn_id(),
                          0x0001, 0xFFFF, db.data(), &count);
     out.reserve(count);

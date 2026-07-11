@@ -63,7 +63,7 @@ template <typename S, typename V> inline void publish_if(S *s, V v) {
 inline void publish_if(esphome::sensor::Sensor *s, float v) {
   if (s == nullptr)
     return;
-  if (s->has_state() && s->raw_state == v)
+  if (s->has_state() && s->get_raw_state() == v)
     return;
   s->publish_state(v);
 }

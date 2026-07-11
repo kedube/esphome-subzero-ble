@@ -76,33 +76,10 @@ inline const std::string &build_poll_command(PollVerb v) {
   return v == PollVerb::kGet ? build_get() : build_get_async();
 }
 
-inline bool has_status_value(const std::string &msg, char digit) {
-  static constexpr const char *kStatusKey = "\"status\":";
-  static constexpr std::size_t kKeyLen = 9; // strlen(kStatusKey)
-  std::size_t pos = 0;
-  while ((pos = msg.find(kStatusKey, pos)) != std::string::npos) {
-    std::size_t v = pos + kKeyLen;
-    // Skip optional whitespace after colon.
-    while (v < msg.size() && (msg[v] == ' ' || msg[v] == '\t'))
-      v++;
-    if (v < msg.size() && msg[v] == digit) {
-      char next = (v + 1 < msg.size()) ? msg[v + 1] : '\0';
-      if (next < '0' || next > '9') {
-        return true;
-      }
-    }
-    pos++;
-  }
-  return false;
-}
-
-inline bool is_lacking_properties_response(const std::string &msg) {
-  if (!has_status_value(msg, '1'))
-    return false;
-  // Empty resp object — accept both spacing variants observed on the wire.
-  return msg.find("\"resp\":{}") != std::string::npos ||
-         msg.find("\"resp\": {}") != std::string::npos;
-}
+// NOTE: the raw-buffer scanners has_status_value() /
+// is_lacking_properties_response() were removed — the parsers now capture
+// `status` and `lacking_properties` structurally (see protocol.h), so the
+// hub never rescans the message text.
 
 inline std::string build_display_pin(int duration_seconds = 30) {
   return "{\"cmd\":\"display_pin\",\"params\":{\"duration\": " +

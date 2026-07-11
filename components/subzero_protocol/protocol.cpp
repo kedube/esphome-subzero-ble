@@ -40,27 +40,46 @@ std::optional<float> opt_float(JsonVariantConst v) {
   return v.as<float>();
 }
 
-// Returns the data object (resp for polls, props for pushes) and sets is_poll.
-// Returns a null object if the format is unrecognized or status != 0.
 void collect_keys(JsonObjectConst data, std::vector<std::string> &out) {
   for (JsonPairConst kv : data) {
     out.emplace_back(kv.key().c_str());
   }
 }
 
-JsonObjectConst extract_data(JsonObjectConst root, bool &is_poll) {
+// Protocol-level metadata captured alongside the data object, even when the
+// message is rejected (status != 0). The hub consumes status /
+// lacking_properties on the failure path (302 → pairing revoked, lacking →
+// poll-verb fallback) instead of rescanning the raw buffer.
+struct ParseMeta {
+  bool is_poll = true;
+  std::optional<int> status;
+  bool lacking_properties = false;
+};
+
+// Returns the data object (resp for polls, props for pushes) and fills meta.
+// Returns a null object if the format is unrecognized or status != 0.
+JsonObjectConst extract_data(JsonObjectConst root, ParseMeta &meta) {
   if (root["status"].is<int>()) {
-    if (root["status"].as<int>() != 0)
+    int status = root["status"].as<int>();
+    meta.status = status;
+    if (status != 0) {
+      // "lacking properties" rejection: exactly status:1 with an empty
+      // resp object (the IR36550ST get_async failure from issue #91).
+      if (status == 1 && root["resp"].is<JsonObjectConst>() &&
+          root["resp"].as<JsonObjectConst>().size() == 0) {
+        meta.lacking_properties = true;
+      }
       return JsonObjectConst();
-    is_poll = true;
+    }
+    meta.is_poll = true;
     return root["resp"].as<JsonObjectConst>();
   }
   if (root["props"].is<JsonObjectConst>()) {
-    is_poll = false;
+    meta.is_poll = false;
     return root["props"].as<JsonObjectConst>();
   }
   if (root["msg_types"].is<int>() && root["msg_types"].as<int>() == 1) {
-    is_poll = false;
+    meta.is_poll = false;
     return root;
   }
   return JsonObjectConst();
@@ -214,10 +233,13 @@ std::optional<int> minutes_between(const char *now_iso,
 
 } // namespace
 
-FridgeState parse_fridge(const std::string &json, bool capture_keys) {
+FridgeState parse_fridge_in_place(std::string &json, bool capture_keys) {
   FridgeState state;
   JsonDocument doc;
-  if (deserializeJson(doc, json))
+  // Mutable input → ArduinoJson zero-copy mode: strings in `doc` point into
+  // `json` instead of being duplicated. `json` is consumed (unescaped in
+  // place) — see the header comment.
+  if (deserializeJson(doc, json.data(), json.size()))
     return state;
   if (!doc.is<JsonObject>())
     return state;
@@ -225,8 +247,10 @@ FridgeState parse_fridge(const std::string &json, bool capture_keys) {
   // Extract notif_event from root first — `notif_type` lives at the root of
   // push messages, alongside `seq`/`timestamp`, NOT inside `props`.
   auto notif_event = fridge_notif_event(root);
-  bool is_poll = true;
-  JsonObjectConst data = extract_data(root, is_poll);
+  ParseMeta meta;
+  JsonObjectConst data = extract_data(root, meta);
+  state.status = meta.status;
+  state.lacking_properties = meta.lacking_properties;
   if (data.isNull()) {
     // msg_types:4 notification-only push: no `props`/`resp`, just notif_type
     // at root. Mark valid so the bus can publish the event; leave data
@@ -239,7 +263,7 @@ FridgeState parse_fridge(const std::string &json, bool capture_keys) {
     return state;
   }
   state.valid = true;
-  state.is_poll = is_poll;
+  state.is_poll = meta.is_poll;
   state.notif_event = std::move(notif_event);
   if (capture_keys)
     collect_keys(data, state.data_keys);
@@ -290,17 +314,25 @@ FridgeState parse_fridge(const std::string &json, bool capture_keys) {
   return state;
 }
 
-DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
+FridgeState parse_fridge(const std::string &json, bool capture_keys) {
+  std::string copy(json);
+  return parse_fridge_in_place(copy, capture_keys);
+}
+
+DishwasherState parse_dishwasher_in_place(std::string &json,
+                                          bool capture_keys) {
   DishwasherState state;
   JsonDocument doc;
-  if (deserializeJson(doc, json))
+  if (deserializeJson(doc, json.data(), json.size()))
     return state;
   if (!doc.is<JsonObject>())
     return state;
   JsonObjectConst root = doc.as<JsonObjectConst>();
   auto notif_event = dishwasher_notif_event(root);
-  bool is_poll = true;
-  JsonObjectConst data = extract_data(root, is_poll);
+  ParseMeta meta;
+  JsonObjectConst data = extract_data(root, meta);
+  state.status = meta.status;
+  state.lacking_properties = meta.lacking_properties;
   if (data.isNull()) {
     if (notif_event) {
       state.valid = true;
@@ -310,7 +342,7 @@ DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
     return state;
   }
   state.valid = true;
-  state.is_poll = is_poll;
+  state.is_poll = meta.is_poll;
   state.notif_event = std::move(notif_event);
   if (capture_keys)
     collect_keys(data, state.data_keys);
@@ -335,7 +367,7 @@ DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
     const char *now_iso = nullptr;
     if (root["timestamp"].is<const char *>()) {
       now_iso = root["timestamp"].as<const char *>();
-    } else if (is_poll && data["time"].is<const char *>()) {
+    } else if (meta.is_poll && data["time"].is<const char *>()) {
       now_iso = data["time"].as<const char *>();
     }
     if (now_iso) {
@@ -346,17 +378,24 @@ DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
   return state;
 }
 
-RangeState parse_range(const std::string &json, bool capture_keys) {
+DishwasherState parse_dishwasher(const std::string &json, bool capture_keys) {
+  std::string copy(json);
+  return parse_dishwasher_in_place(copy, capture_keys);
+}
+
+RangeState parse_range_in_place(std::string &json, bool capture_keys) {
   RangeState state;
   JsonDocument doc;
-  if (deserializeJson(doc, json))
+  if (deserializeJson(doc, json.data(), json.size()))
     return state;
   if (!doc.is<JsonObject>())
     return state;
   JsonObjectConst root = doc.as<JsonObjectConst>();
   auto notif_event = range_notif_event(root);
-  bool is_poll = true;
-  JsonObjectConst data = extract_data(root, is_poll);
+  ParseMeta meta;
+  JsonObjectConst data = extract_data(root, meta);
+  state.status = meta.status;
+  state.lacking_properties = meta.lacking_properties;
   if (data.isNull()) {
     if (notif_event) {
       state.valid = true;
@@ -366,7 +405,7 @@ RangeState parse_range(const std::string &json, bool capture_keys) {
     return state;
   }
   state.valid = true;
-  state.is_poll = is_poll;
+  state.is_poll = meta.is_poll;
   state.notif_event = std::move(notif_event);
   if (capture_keys)
     collect_keys(data, state.data_keys);
@@ -423,6 +462,11 @@ RangeState parse_range(const std::string &json, bool capture_keys) {
   state.cav2_probe_temp = opt_float(data["cav2_probe_temp"]);
   state.cav2_probe_set_temp = opt_float(data["cav2_probe_set_temp"]);
   return state;
+}
+
+RangeState parse_range(const std::string &json, bool capture_keys) {
+  std::string copy(json);
+  return parse_range_in_place(copy, capture_keys);
 }
 } // namespace subzero_protocol
 } // namespace esphome

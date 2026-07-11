@@ -19,8 +19,10 @@ public:
   void set_bus(esphome::subzero_protocol::RangeBus *bus) { bus_ = bus; }
 
 protected:
-  bool parse_and_dispatch_(const std::string &msg) override {
-    auto s = esphome::subzero_protocol::parse_range(msg, debug_mode());
+  bool parse_and_dispatch_(std::string &msg) override {
+    auto s =
+        esphome::subzero_protocol::parse_range_in_place(msg, debug_mode());
+    note_response_meta_(s.status, s.lacking_properties);
     if (!s.valid)
       return false;
     note_poll_response_(s.is_poll);

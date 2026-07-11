@@ -30,18 +30,22 @@ public:
   TestHub() = default;
 
   // Default: succeed and capture the message.
-  bool parse_and_dispatch_(const std::string &msg) override {
+  bool parse_and_dispatch_(std::string &msg) override {
     last_message_ = msg;
     parse_called_ = true;
+    // Mirror the real subclasses' contract: run the real parser (the
+    // copying variant — tests inspect last_message_ and the raw payload)
+    // and report protocol metadata via note_response_meta_() on every
+    // parse, plus is_poll via note_poll_response_() on success. The base
+    // hub consumes these instead of re-scanning the buffer, so the
+    // zombie-counter / 302 / lacking-properties tests exercise the
+    // production code path.
+    auto s = esphome::subzero_protocol::parse_fridge(msg);
+    note_response_meta_(s.status, s.lacking_properties);
     if (parse_should_confirm_pin_) {
       on_pin_confirmed_(pin_to_confirm_);
     }
     if (parse_should_succeed_) {
-      // Mirror the real subclasses' contract: derive is_poll from the
-      // parser and report it via note_poll_response_(). The base hub
-      // uses this (instead of re-scanning the buffer) to set poll_ok_,
-      // so the zombie-counter tests exercise the production code path.
-      auto s = esphome::subzero_protocol::parse_fridge(msg);
       note_poll_response_(s.is_poll);
     }
     return parse_should_succeed_;
@@ -608,7 +612,7 @@ namespace {
 class RecordingFridgeLikeHub : public SubzeroHub {
 public:
   RecordingFridgeLikeHub() = default;
-  bool parse_and_dispatch_(const std::string &msg) override {
+  bool parse_and_dispatch_(std::string &msg) override {
     auto s = esphome::subzero_protocol::parse_fridge(msg);
     if (!s.valid)
       return false;
@@ -631,7 +635,7 @@ protected:
 } // namespace
 
 TEST_F(FridgeLikeFixture, ParseAndDispatch_InvokesLogDataKeysWithParsedKeys) {
-  const std::string msg =
+  std::string msg =
       R"({"status":0,"resp":{"sabbath_on":false,"ref_set_temp":38,"appliance_model":"DEU2450R"}})";
 
   bool ok = hub_.parse_and_dispatch_(msg);
@@ -652,7 +656,8 @@ TEST_F(FridgeLikeFixture, ParseAndDispatch_InvokesLogDataKeysWithParsedKeys) {
 }
 
 TEST_F(FridgeLikeFixture, ParseAndDispatch_DoesNotInvokeLogOnParseFailure) {
-  bool ok = hub_.parse_and_dispatch_("not json at all");
+  std::string msg = "not json at all";
+  bool ok = hub_.parse_and_dispatch_(msg);
   EXPECT_FALSE(ok);
   EXPECT_EQ(hub_.log_calls_.size(), 0u);
 }
@@ -661,7 +666,7 @@ namespace {
 
 class GuardSpyHub : public SubzeroHub {
 public:
-  bool parse_and_dispatch_(const std::string &) override { return true; }
+  bool parse_and_dispatch_(std::string &) override { return true; }
   void log_data_keys_(const std::vector<std::string> &keys) override {
     invocations_++;
     SubzeroHub::log_data_keys_(keys); // exercises the debug_mode_ guard

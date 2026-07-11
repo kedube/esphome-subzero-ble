@@ -124,6 +124,9 @@ void SubzeroHub::handle_disconnected() {
         phase_ = 0;
         fast_retries_ = 0;
         publish_status_("Bond cleared, re-pairing on next connect...");
+        // Return early: the generic "Disconnected" below would immediately
+        // overwrite the bond-cleared instruction in the HA status sensor.
+        return;
       } else {
         HUB_LOGI("ble", "[%s] Disconnected (handles cached, d5=%d, retries=%d)",
                  name_.c_str(), d5_handle_, fast_retries_);
@@ -168,23 +171,33 @@ void SubzeroHub::handle_d6_notify(const std::uint8_t *data, std::size_t len) {
 }
 
 void SubzeroHub::process_message_complete_() {
-  auto msg = json_buf_.take_message();
-  if (!msg)
+  // Parse straight out of json_buf_'s storage — message_in_place() trims
+  // leading ACL garbage in place, avoiding the multi-KB copy-out the old
+  // take_message() path made on every poll response.
+  std::string *msg = json_buf_.message_in_place();
+  if (msg == nullptr)
     return;
+  handle_complete_message_(*msg);
+  json_buf_.clear();
+}
 
+void SubzeroHub::handle_complete_message_(std::string &msg) {
   HUB_LOGI("szg", "[%s] Parsing JSON (%d bytes)", name_.c_str(),
-           static_cast<int>(msg->size()));
+           static_cast<int>(msg.size()));
 
   if (debug_mode_)
-    log_chunked_debug_(*msg);
+    log_chunked_debug_(msg);
 
-  // Cleared before the parse; the subclass calls note_poll_response_() with
-  // State::is_poll on the success path, so we can set poll_ok_ below without
-  // a second full-buffer scan via has_status_value().
+  // Cleared before the parse; the subclass reports back via
+  // note_poll_response_() (success path) and note_response_meta_()
+  // (every parse), so the failure handling below never has to rescan
+  // the buffer — which the zero-copy parser scrambles anyway.
   last_was_status0_poll_ = false;
-  bool ok = parse_and_dispatch_(*msg);
+  last_status_.reset();
+  last_lacking_properties_ = false;
+  bool ok = parse_and_dispatch_(msg);
   if (!ok) {
-    if (msg->find("\"status\":302") != std::string::npos) {
+    if (last_status_ == 302) {
       HUB_LOGE("szg",
                "[%s] Pairing rejected (status 302). The PIN has likely "
                "changed - press 'Start Pairing' on the appliance and "
@@ -194,26 +207,28 @@ void SubzeroHub::process_message_complete_() {
           "Pairing required - press Start Pairing and re-enter PIN");
       return;
     }
-    if (handle_lacking_properties_(*msg))
+    if (handle_lacking_properties_())
       return;
+    // msg may be parser-mutated at this point; the snippet is corruption
+    // forensics, not a faithful wire capture.
     HUB_LOGW("szg", "[%s] Parse failed or status!=0, skipping (%s...)",
              name_.c_str(),
              esphome::subzero_protocol::sanitize_for_log(
-                 *msg, 0, std::min<std::size_t>(80, msg->size()))
+                 msg, 0, std::min<std::size_t>(80, msg.size()))
                  .c_str());
     return;
   }
   fast_retries_ = 0;
   // is_poll is set by the parser only when the message was a status:0 poll
-  // response (extract_data), which is exactly what the old
-  // has_status_value(*msg, '0') scan detected — minus the rescan.
+  // response (extract_data), which is exactly what the old full-buffer
+  // status scan detected — minus the rescan.
   if (last_was_status0_poll_) {
     poll_ok_ = true;
   }
 }
 
-bool SubzeroHub::handle_lacking_properties_(const std::string &msg) {
-  if (!esphome::subzero_protocol::is_lacking_properties_response(msg))
+bool SubzeroHub::handle_lacking_properties_() {
+  if (!last_lacking_properties_)
     return false;
   if (poll_verb_ == esphome::subzero_protocol::PollVerb::kGetAsync) {
     HUB_LOGW("szg",
@@ -247,6 +262,7 @@ bool SubzeroHub::handle_lacking_properties_(const std::string &msg) {
 
 void SubzeroHub::on_pin_confirmed_(const std::string &pin) {
   stored_pin_ = pin;
+  unlock_cmd_.clear(); // rebuilt lazily by write_unlock_channel_
   pin_confirmed_ = true;
   if (pin_input_cb_)
     pin_input_cb_(pin);
@@ -683,6 +699,7 @@ void SubzeroHub::press_reset_pairing() {
 
 void SubzeroHub::set_stored_pin(const std::string &pin) {
   stored_pin_ = pin;
+  unlock_cmd_.clear(); // rebuilt lazily by write_unlock_channel_
   if (!pin.empty()) {
     HUB_LOGI("szg", "[%s] PIN updated: %s", name_.c_str(), pin.c_str());
   }
@@ -717,21 +734,17 @@ void SubzeroHub::clear_handles_() {
   d7_handle_ = 0;
 }
 
-void SubzeroHub::clear_session_state_() {
-  json_buf_.clear();
-  poll_ok_ = false;
-  poll_miss_ = 0;
-}
-
 void SubzeroHub::write_unlock_channel_(std::uint16_t handle) {
   if (transport_ == nullptr)
     return;
   if (stored_pin_.empty() || handle == 0)
     return;
-  std::string cmd =
-      esphome::subzero_protocol::build_unlock_channel(stored_pin_);
-  transport_->write(handle, reinterpret_cast<const std::uint8_t *>(cmd.data()),
-                    cmd.size());
+  if (unlock_cmd_.empty()) {
+    unlock_cmd_ = esphome::subzero_protocol::build_unlock_channel(stored_pin_);
+  }
+  transport_->write(handle,
+                    reinterpret_cast<const std::uint8_t *>(unlock_cmd_.data()),
+                    unlock_cmd_.size());
 }
 
 void SubzeroHub::write_poll_command_(std::uint16_t handle) {

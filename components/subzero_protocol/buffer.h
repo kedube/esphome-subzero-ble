@@ -84,26 +84,42 @@ public:
     return complete_;
   }
 
-  // If a complete message is buffered, return the substring starting at
-  // the first `{` (leading garbage from ACL corruption is dropped) and
-  // reset internal state. If no message is complete or no `{` exists,
-  // returns nullopt; in the no-`{` case the buffer is also cleared as
-  // unrecoverable garbage (matches the prior parse_json script behavior).
-  inline std::optional<std::string> take_message() {
+  // If a complete message is buffered, trim leading garbage (from ACL
+  // corruption) in place and return a pointer to the internal buffer.
+  // The pointer stays valid until the next feed()/clear(); the caller
+  // processes the message and then calls clear(). If no message is
+  // complete returns nullptr; if no `{` exists the buffer is cleared as
+  // unrecoverable garbage and nullptr is returned (matches the prior
+  // parse_json script behavior).
+  //
+  // This is the production path: compared to take_message() it avoids
+  // copying the multi-KB message out on every poll response while still
+  // preserving buf_'s reserved capacity across messages (clear() keeps
+  // the allocation).
+  inline std::string *message_in_place() {
     if (!complete_) {
-      return std::nullopt;
+      return nullptr;
     }
     std::size_t start = buf_.find('{');
     if (start == std::string::npos) {
       clear();
+      return nullptr;
+    }
+    buf_.erase(0, start);
+    return &buf_;
+  }
+
+  // Copying variant of message_in_place() — returns the message by value
+  // and resets state. Copies out (rather than moving buf_) so the
+  // reserved capacity survives the reset; moving would leave buf_ with
+  // capacity 0, forcing the kReserveHint reserve to reallocate the ~2KB
+  // buffer on every message, which churns and fragments the ESP32 heap.
+  inline std::optional<std::string> take_message() {
+    std::string *msg = message_in_place();
+    if (msg == nullptr) {
       return std::nullopt;
     }
-    // Copy out (rather than move) so buf_'s reserved capacity survives the
-    // reset — moving would leave buf_ empty with capacity 0, forcing the
-    // kReserveHint reserve to reallocate the ~2KB buffer on every poll
-    // (~1,440x/day), which churns and fragments the ESP32 heap. clear()
-    // keeps the existing allocation for the next message.
-    std::string out(buf_, start);
+    std::string out(*msg);
     clear();
     return out;
   }

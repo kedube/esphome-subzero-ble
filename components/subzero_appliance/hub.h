@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -165,7 +166,12 @@ protected:
   // The base class hub provides the surrounding logic (chunked debug
   // log, status-302 detection, set poll_ok / fast_retries on success).
   // The subclass just plugs in the type-specific parse+dispatch.
-  virtual bool parse_and_dispatch_(const std::string &msg) = 0;
+  //
+  // `msg` is mutable because the production subclasses hand it to the
+  // zero-copy `parse_*_in_place` parsers, which unescape the JSON in
+  // place. After this call returns the base treats the buffer contents
+  // as scrambled (only failure-path log snippets touch it).
+  virtual bool parse_and_dispatch_(std::string &msg) = 0;
 
   // ---- Subclass hooks for PIN confirmation ----
   // Called from parse_and_dispatch_() implementation when the parsed
@@ -175,11 +181,25 @@ protected:
 
   // Subclass hook — record whether the just-parsed message was a status:0
   // poll response (State::is_poll). The base consumes this to set poll_ok_
-  // instead of re-scanning the whole JSON buffer with has_status_value()
-  // after the parser already determined the status. Call from
-  // parse_and_dispatch_() on the success path, passing State::is_poll.
+  // instead of re-scanning the whole JSON buffer after the parser already
+  // determined the status. Call from parse_and_dispatch_() on the success
+  // path, passing State::is_poll.
   void note_poll_response_(bool is_status0_poll) {
     last_was_status0_poll_ = is_status0_poll;
+  }
+
+  // Subclass hook — record protocol-level metadata from the just-parsed
+  // message (raw status code + lacking-properties rejection), captured by
+  // the parser even when the parse was rejected. The base consumes these
+  // on the failure path (302 → pairing message, lacking → poll-verb
+  // fallback) instead of re-scanning the raw buffer — which is no longer
+  // meaningful anyway, since the zero-copy parser scrambles it in place.
+  // Call from parse_and_dispatch_() on every parse, before the valid
+  // check, passing State::status and State::lacking_properties.
+  void note_response_meta_(const std::optional<int> &status,
+                           bool lacking_properties) {
+    last_status_ = status;
+    last_lacking_properties_ = lacking_properties;
   }
   // Virtual so host tests can spy on the subclass call contract
   virtual void log_data_keys_(const std::vector<std::string> &keys);
@@ -214,12 +234,12 @@ private:
   // place — adding a new timeout means updating only this method.
   void cancel_all_timeouts_();
   void clear_handles_();
-  void clear_session_state_();
   void process_message_complete_();
+  void handle_complete_message_(std::string &msg);
   void log_chunked_debug_(const std::string &msg);
   void write_unlock_channel_(std::uint16_t handle);
   void write_poll_command_(std::uint16_t handle);
-  bool handle_lacking_properties_(const std::string &msg);
+  bool handle_lacking_properties_();
   void write_set_property_(const std::string &key,
                            const std::string &json_value);
   void update_handles_from_db_();
@@ -238,13 +258,23 @@ private:
   std::uint16_t d6_handle_ = 0;
   std::uint16_t d7_handle_ = 0;
   std::string stored_pin_;
+  // Cached unlock_channel command for stored_pin_. Rebuilt lazily by
+  // write_unlock_channel_ and invalidated (cleared) whenever stored_pin_
+  // changes — the unlock is written on every 60s poll, so this saves a
+  // JSON build + allocation per cycle.
+  std::string unlock_cmd_;
   bool pin_confirmed_ = true; // matches YAML's restore_value:true initial
   bool poll_ok_ = false;
   // Set by note_poll_response_() during parse_and_dispatch_(); read once in
-  // process_message_complete_() to set poll_ok_ without re-scanning the
+  // handle_complete_message_() to set poll_ok_ without re-scanning the
   // buffer. Reset to false before each parse so a non-poll push doesn't
   // leave a stale true behind.
   bool last_was_status0_poll_ = false;
+  // Set by note_response_meta_() during parse_and_dispatch_(); consumed on
+  // the failure path of handle_complete_message_(). Reset before each
+  // parse.
+  std::optional<int> last_status_;
+  bool last_lacking_properties_ = false;
   int fast_retries_ = 0;
   int poll_miss_ = 0;
   bool debug_mode_ = false;

@@ -52,6 +52,31 @@ template <typename S, typename V> inline void publish_if(S *s, V v) {
     s->publish_state(v);
 }
 
+// Dedupe overloads for Sensor and TextSensor: unlike BinarySensor (and
+// Switch), these entity types do NOT dedupe in the ESPHome framework —
+// every publish_state fires callbacks, logs a line, and sends an API
+// state message to HA. The 60s poll re-publishes many values that rarely
+// change (model, serial, firmware versions, setpoints), so skipping
+// unchanged values here saves dozens of redundant API messages per poll
+// cycle. Trade-off: unchanged entities no longer get a per-poll
+// last_updated heartbeat in HA.
+inline void publish_if(esphome::sensor::Sensor *s, float v) {
+  if (s == nullptr)
+    return;
+  if (s->has_state() && s->raw_state == v)
+    return;
+  s->publish_state(v);
+}
+
+inline void publish_if(esphome::text_sensor::TextSensor *s,
+                       const std::string &v) {
+  if (s == nullptr)
+    return;
+  if (s->has_state() && s->state == v)
+    return;
+  s->publish_state(v);
+}
+
 } // namespace detail
 
 // Common (appliance-agnostic) bus. Inherited by every appliance bus.

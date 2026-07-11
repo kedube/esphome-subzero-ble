@@ -35,6 +35,14 @@ struct FridgeState {
   // from "an unrelated push arrived" — critical for detecting unlock-session
   // expiry where polls stop responding but pushes keep flowing.
   bool is_poll = false;
+  // Raw top-level "status" value, captured even when the parse is rejected
+  // (valid == false). Lets the hub react to protocol-level rejections
+  // (302 = pairing revoked) without rescanning the raw buffer — which the
+  // in-place parser scrambles anyway.
+  std::optional<int> status;
+  // True when the appliance rejected the poll verb with
+  // {"status":1,"resp":{}} ("lacking properties", issue #91).
+  bool lacking_properties = false;
   // Top-level keys present in the data object (resp or props), in order.
   // Populated on every parse; the lambdas log these when debug mode is on.
   std::vector<std::string> data_keys;
@@ -66,6 +74,9 @@ struct FridgeState {
 struct DishwasherState {
   bool valid = false;
   bool is_poll = false;
+  // See FridgeState for status / lacking_properties semantics.
+  std::optional<int> status;
+  bool lacking_properties = false;
   std::vector<std::string> data_keys;
   std::optional<std::string> notif_event;
   CommonFields common;
@@ -89,6 +100,9 @@ struct DishwasherState {
 struct RangeState {
   bool valid = false;
   bool is_poll = false;
+  // See FridgeState for status / lacking_properties semantics.
+  std::optional<int> status;
+  bool lacking_properties = false;
   std::vector<std::string> data_keys;
   std::optional<std::string> notif_event;
   CommonFields common;
@@ -143,6 +157,19 @@ struct RangeState {
 // the hub's debug-mode logging. Production passes the hub's debug_mode_ flag
 // so the allocation is skipped on the hot poll path; it defaults to true so
 // the parser tests (which assert on data_keys) keep working unchanged.
+//
+// The `_in_place` variants deserialize with ArduinoJson's zero-copy mode:
+// strings in the parsed document point into `json` instead of being
+// duplicated, roughly halving peak parse memory. The trade-off is that
+// `json` is consumed (unescaped in place) and must not be reused after the
+// call. Production feeds the hub's message buffer through these; the const
+// overloads copy first — same results, for callers (tests) that need the
+// input preserved.
+FridgeState parse_fridge_in_place(std::string &json, bool capture_keys = true);
+DishwasherState parse_dishwasher_in_place(std::string &json,
+                                          bool capture_keys = true);
+RangeState parse_range_in_place(std::string &json, bool capture_keys = true);
+
 FridgeState parse_fridge(const std::string &json, bool capture_keys = true);
 DishwasherState parse_dishwasher(const std::string &json,
                                  bool capture_keys = true);

@@ -581,4 +581,123 @@ TEST(ProtocolTest, DishwasherNegativeRemainingClampsToZero) {
   EXPECT_EQ(*d.wash_time_remaining_min, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Structured status / lacking_properties capture. These replace the old
+// commands.h raw-buffer scanners (has_status_value /
+// is_lacking_properties_response) — same wire-format edge cases, now
+// asserted on the parser output the hub actually consumes.
+// ---------------------------------------------------------------------------
+
+TEST(ProtocolTest, StatusCapturedOnRejectedParse) {
+  auto f = parse_fridge(R"({"status":302})");
+  EXPECT_FALSE(f.valid);
+  ASSERT_TRUE(f.status.has_value());
+  EXPECT_EQ(*f.status, 302);
+  EXPECT_FALSE(f.lacking_properties);
+}
+
+TEST(ProtocolTest, StatusCapturedOnSuccessfulPoll) {
+  auto f = parse_fridge(R"({"status":0,"resp":{"ref_set_temp":38}})");
+  ASSERT_TRUE(f.valid);
+  ASSERT_TRUE(f.status.has_value());
+  EXPECT_EQ(*f.status, 0);
+  EXPECT_FALSE(f.lacking_properties);
+}
+
+TEST(ProtocolTest, StatusAbsentOnPushMessages) {
+  auto f = parse_fridge(
+      R"({"msg_types":2,"seq":1,"props":{"ref_door_ajar":true}})");
+  ASSERT_TRUE(f.valid);
+  EXPECT_FALSE(f.status.has_value());
+  EXPECT_FALSE(f.lacking_properties);
+}
+
+TEST(ProtocolTest, LackingProperties_ExactSentinel) {
+  // The IR36550ST get_async rejection from issue #91.
+  auto f = parse_fridge(
+      "{\"status\":1,\"resp\":{},\"status_msg\":\"An error occurred\"}\n");
+  EXPECT_FALSE(f.valid);
+  EXPECT_TRUE(f.lacking_properties);
+}
+
+TEST(ProtocolTest, LackingProperties_WhitespaceVariantsAccepted) {
+  // Structured parsing is spacing-agnostic — variants that needed special
+  // cases in the old string scanner all trip.
+  EXPECT_TRUE(parse_fridge("{\"status\":1,\"resp\": {}}").lacking_properties);
+  EXPECT_TRUE(parse_fridge("{\"status\": 1,\"resp\":{}}").lacking_properties);
+  EXPECT_TRUE(
+      parse_fridge("{\"status\": 1, \"resp\": {}}").lacking_properties);
+}
+
+TEST(ProtocolTest, LackingProperties_RejectsStatusZeroAndDataResponses) {
+  EXPECT_FALSE(parse_fridge(R"({"status":0,"resp":{"ref_set_temp":38}})")
+                   .lacking_properties);
+  EXPECT_FALSE(parse_fridge(R"({"status":1,"resp":{"ref_set_temp":38}})")
+                   .lacking_properties);
+  EXPECT_FALSE(
+      parse_fridge(R"({"status":302,"resp":{}})").lacking_properties);
+}
+
+TEST(ProtocolTest, LackingProperties_RejectsOtherStatusValues) {
+  // Only exactly status:1 counts — 10/11/100/1234 must not trip (the old
+  // scanner's digit-suffix edge case).
+  EXPECT_FALSE(parse_fridge(R"({"status":10,"resp":{}})").lacking_properties);
+  EXPECT_FALSE(parse_fridge(R"({"status":11,"resp":{}})").lacking_properties);
+  EXPECT_FALSE(
+      parse_fridge(R"({"status":100,"resp":{}})").lacking_properties);
+  EXPECT_FALSE(
+      parse_fridge(R"({"status":1234,"resp":{}})").lacking_properties);
+}
+
+TEST(ProtocolTest, LackingProperties_RejectsHealthyPush) {
+  EXPECT_FALSE(
+      parse_fridge(R"({"msg_types":2,"seq":92,"props":{"ref_door_ajar":true}})")
+          .lacking_properties);
+}
+
+TEST(ProtocolTest, StatusCapturedForAllApplianceParsers) {
+  EXPECT_EQ(*parse_dishwasher(R"({"status":302})").status, 302);
+  EXPECT_EQ(*parse_range(R"({"status":302})").status, 302);
+  EXPECT_TRUE(parse_dishwasher(R"({"status":1,"resp":{}})").lacking_properties);
+  EXPECT_TRUE(parse_range(R"({"status":1,"resp":{}})").lacking_properties);
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy in-place parsing — must produce identical results to the
+// copying overloads, including escaped strings (the unescape happens in
+// the input buffer itself).
+// ---------------------------------------------------------------------------
+
+TEST(ProtocolTest, InPlaceParseMatchesConstParse) {
+  const std::string wire = R"({
+    "status":0,"resp":{
+      "ref_set_temp":38,"frz_set_temp":-2,"ref_door_ajar":true,
+      "appliance_model":"DEU2450R","appliance_serial":" ABC123 ",
+      "version":{"fw":"8.5","api":"1.2"}
+    }
+  })";
+  auto expected = parse_fridge(wire);
+  std::string mutable_copy = wire;
+  auto actual = parse_fridge_in_place(mutable_copy);
+
+  ASSERT_TRUE(actual.valid);
+  EXPECT_EQ(actual.is_poll, expected.is_poll);
+  EXPECT_EQ(actual.ref_set_temp, expected.ref_set_temp);
+  EXPECT_EQ(actual.frz_set_temp, expected.frz_set_temp);
+  EXPECT_EQ(actual.door_ajar, expected.door_ajar);
+  EXPECT_EQ(actual.common.appliance_model, expected.common.appliance_model);
+  EXPECT_EQ(actual.common.appliance_serial, expected.common.appliance_serial);
+  EXPECT_EQ(actual.common.version.fw, expected.common.version.fw);
+  EXPECT_EQ(actual.common.version.api, expected.common.version.api);
+}
+
+TEST(ProtocolTest, InPlaceParseUnescapesStringsCorrectly) {
+  std::string wire =
+      R"({"status":0,"resp":{"appliance_model":"say \"hi\"\nthere"}})";
+  auto f = parse_fridge_in_place(wire);
+  ASSERT_TRUE(f.valid);
+  ASSERT_TRUE(f.common.appliance_model.has_value());
+  EXPECT_EQ(*f.common.appliance_model, "say \"hi\"\nthere");
+}
+
 } // namespace

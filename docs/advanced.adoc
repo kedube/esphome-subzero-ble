@@ -106,9 +106,10 @@ If you only have *one* appliance, you do not need these - the defaults work fine
 The ESP32 (non-PSRAM) has only 320 KB of RAM. With BLE client connections, the BLE stack alone consumes a significant portion.
 This integration uses several strategies to avoid out-of-memory crashes:
 
-* JSON response buffers are *pre-reserved* to 2048 bytes at startup to avoid repeated heap reallocation during the 40+ BLE indication fragments
-* JSON parsing uses ESPHome's built-in `json` component (ArduinoJson) with a temporary heap allocation that is freed immediately after parsing
-* JSON parsing runs on the *main loop* (via ESPHome scripts), not inside the BLE notification callback
+* JSON response buffers are *pre-reserved* to 2048 bytes at startup to avoid repeated heap reallocation during the 40+ BLE indication fragments, and the buffer's allocation is retained across messages
+* Complete messages are parsed *in place* out of the reassembly buffer (no copy-out), using ArduinoJson's zero-copy mode - parsed strings point into the buffer instead of being duplicated, roughly halving peak parse memory; the temporary JSON document is freed immediately after parsing
+* JSON parsing runs on the *main loop* (via the hub component), not inside the BLE notification callback
+* Unchanged sensor and text-sensor values are *not re-published* on each 60s poll - this suppresses dozens of redundant Home Assistant API messages per poll cycle. Side effect: `last_updated` on static entities (model, serial, firmware versions) only advances when the value actually changes.
 * Logger levels are tuned to suppress high-frequency BLE debug messages that would otherwise overwhelm the API frame buffer
 
 If you experience crashes (typically `__cxa_allocate_exception` -> `operator new` -> `abort()`), try:
@@ -120,21 +121,27 @@ If you experience crashes (typically `__cxa_allocate_exception` -> `operator new
 [[reconnect-logic]]
 == Reconnect Logic
 
-The integration runs a periodic poll every 60 seconds against each bonded appliance and keeps things alive with two simple mechanisms: zombie detection (catches a dead link) and stale-bond cleanup (catches an overnight bond timeout).
+The integration runs a periodic poll every 60 seconds against each bonded appliance and keeps things alive with two simple mechanisms: a scheduled session refresh (pre-empts the firmware's unlock-session expiry) and stale-bond cleanup (catches an overnight bond timeout).
 
-=== Zombie Detection
+=== Scheduled Session Refresh
 
-`poll_ok` is set to `true` by any indication on D5 (heartbeat) or D6 (poll response or push notification). Each `periodic_poll` clears `poll_ok` and writes both `unlock_channel` and `get_async` to D6 - either response (~37-byte unlock ack or ~2 KB full state) sets `poll_ok` again. If `poll_ok` is still `false` at the next tick, `poll_miss` increments. When `poll_miss` reaches 3 (~3 minutes of total silence), the integration calls `client->disconnect()` to force a fresh connection - `auto_connect: true` brings it back through `post_bond` + `subscribe` with a fresh full-state poll.
+Roughly 18 minutes after each successful unlock (`kSessionRefreshIntervalMs`), the integration proactively disconnects and lets the fast-reconnect path re-establish the session - cached GATT handles, re-encrypt, re-subscribe, fresh unlock, fresh full-state poll. This pre-empts the appliance firmware's own ~20-25 minute BLE unlock-session expiry, which would otherwise kick the connection unpredictably. The refresh is tagged as intentional so it never counts toward stale-bond detection.
 
-This catches both:
+=== Silent-Poll Diagnostics (`poll_miss`)
 
-* **Cold-boot race.** When multiple appliances reconnect simultaneously at boot, the ESP-IDF Bluedroid stack occasionally drops one peer's `unlock_channel` write under the concurrent traffic. That appliance ends up subscribed and `get_async`-written at the BLE layer (status 0), but never responds. After 3 missed polls the zombie detector reconnects and the cleaner second-time bonding usually succeeds.
+`poll_ok` is set to `true` only when the parser reports a successful *poll response* (`{"status":0,"resp":{...}}`) - push notifications never count. Each `periodic_poll` clears `poll_ok` and writes both `unlock_channel` and `get_async` to D6; if no poll response arrived by the next tick, `poll_miss` increments and shows up in the logs as `miss=N`.
 
-* **fw 8.5 silent-poll behavior.** On Sub-Zero fridges and wall ovens running fw 8.5 / API 5.4, the second-and-later `get_async` writes within a held-open connection go silent - only a full BLE disconnect/reconnect produces a working session again. The official Sub-Zero Android app handles this the same way (verified via HCI snoop). Net effect on fw 8.5: roughly one full state refresh every ~3 min plus continuous push notifications between cycles.
+IMPORTANT: `poll_miss` is *diagnostic-only* - it does not trigger a reconnect. Earlier releases reconnected after 3 misses ("zombie detection"); that was replaced by the scheduled session refresh, which achieves the same recovery on a predictable cadence without churning healthy push-streaming connections.
+
+Two situations produce a climbing `miss` counter:
+
+* **fw 8.5 silent-poll behavior.** On Sub-Zero fridges and wall ovens running fw 8.5 / API 5.4, the second-and-later `get_async` writes within a held-open connection go silent - only a full BLE disconnect/reconnect produces a working session again. The official Sub-Zero Android app handles this the same way (verified via HCI snoop). Net effect on fw 8.5: roughly one full state refresh per ~18-minute session-refresh cycle, plus continuous push notifications in between.
+
+* **Zombie unlock session.** If the bond or unlock state goes bad appliance-side (e.g. after the appliance re-pairs with the official app), the connection stays up but every poll goes silent - `miss` climbs indefinitely and no data ever parses. Session refreshes won't recover a broken bond; if `miss` keeps climbing across multiple refresh cycles, press *Reset Pairing*, power-cycle the appliance, and re-pair.
 
 === Boot Stagger via `poll_offset`
 
-`poll_offset` (config field per appliance, default `0s`) is applied at the top of `periodic_poll`, `post_bond`, and `fast_reconnect`. Setting per-appliance values like `0s / 5s / 10s` on a multi-appliance ESP32 spreads the bonding chains in time so the concurrent-bonding race doesn't trigger in the first place. Zombie detection remains as a safety net.
+`poll_offset` (config field per appliance, default `0s`) is applied at the top of `periodic_poll`, `post_bond`, and `fast_reconnect`. Setting per-appliance values like `0s / 5s / 10s` on a multi-appliance ESP32 spreads the bonding chains in time so the concurrent-bonding race doesn't trigger in the first place. The scheduled session refresh remains as a safety net for sessions that come up broken.
 
 === Log Format
 
@@ -145,7 +152,7 @@ This catches both:
 [E][szg:XXX]: [Kitchen Range]  Pairing rejected (status 302). The PIN has likely changed - press 'Start Pairing' on the appliance and enter the new PIN in HA.
 ----
 
-* `miss` - zombie counter (0–3, reconnect at 3 = ~3 min of total silence)
+* `miss` - silent-poll counter (diagnostic-only; climbs during fw 8.5 silent windows, resets on the next successful poll response)
 * `retries` - fast-reconnect retry counter (0–3, bond clear at 3; see below)
 * `Pairing rejected (status 302)` - the appliance refused `unlock_channel`, usually because its PIN rotated after a power cycle. Press *Start Pairing* and re-enter the PIN displayed on the appliance.
 
@@ -155,8 +162,8 @@ Separately, when the BLE connection drops and `auto_connect: true` reconnects, t
 
 === Tuning
 
-* `interval: 60s` in the hub - poll cadence. Shortening to 30s halves detection time and doubles radio utilization (still single-digit percent for typical configs).
-* `poll_miss >= 3` - zombie threshold. Scales with the interval: at 60s that's 3 min.
+* `interval: 60s` in the hub - poll cadence. Shortening to 30s doubles radio utilization (still single-digit percent for typical configs).
+* `kSessionRefreshIntervalMs` (18 min, in `hub.h`) - session-refresh cadence. Must stay below the firmware's ~20-25 min unlock-session expiry.
 * `poll_offset` per appliance - boot stagger. `0s` for first, `5s` or `10s` for subsequent appliances on the same ESP32.
 
 [[parser-component]]
@@ -170,25 +177,34 @@ The JSON parsing logic (poll responses + push notifications from all three appli
 [source,cpp]
 ----
 namespace esphome::subzero_protocol {
-  FridgeState     parse_fridge(const std::string &json);
-  DishwasherState parse_dishwasher(const std::string &json);
-  RangeState      parse_range(const std::string &json);
+  // Zero-copy variants used in production: deserialize in ArduinoJson's
+  // in-situ mode, consuming (mutating) the input buffer.
+  FridgeState     parse_fridge_in_place(std::string &json, bool capture_keys = true);
+  DishwasherState parse_dishwasher_in_place(std::string &json, bool capture_keys = true);
+  RangeState      parse_range_in_place(std::string &json, bool capture_keys = true);
+
+  // Copying overloads - same results, input preserved (used by tests).
+  FridgeState     parse_fridge(const std::string &json, bool capture_keys = true);
+  DishwasherState parse_dishwasher(const std::string &json, bool capture_keys = true);
+  RangeState      parse_range(const std::string &json, bool capture_keys = true);
 }
 ----
 
 Each state struct has:
 
 * `bool valid` - `false` on malformed JSON, unknown message format, or `status != 0`
-* `bool is_poll` - `true` for `{"status":0,"resp":{...}}` poll responses, `false` for `{"seq":N,"props":{...}}` pushes. Exposed on the parse result for callers that want to distinguish the two; current YAMLs don't read it.
-* `std::vector<std::string> data_keys` - top-level keys in the data object, in order. The YAML lambdas log these when debug mode is on.
+* `bool is_poll` - `true` for `{"status":0,"resp":{...}}` poll responses, `false` for `{"seq":N,"props":{...}}` pushes. The hub uses this to set `poll_ok` only on real poll responses (see <<reconnect-logic>>).
+* `std::optional<int> status` - the raw top-level `status` value, captured even when the parse is rejected. The hub uses it to detect `status: 302` (pairing revoked) without re-scanning the raw buffer.
+* `bool lacking_properties` - `true` when the appliance rejected the poll verb with `{"status":1,"resp":{}}` ("lacking properties"); triggers the hub's `get_async` -> `get` fallback.
+* `std::vector<std::string> data_keys` - top-level keys in the data object, in order. Only collected when `capture_keys` is true; the hub passes its debug-mode flag so the allocation is skipped on the normal poll path.
 * `CommonFields common` - shared appliance metadata (model, uptime, diagnostic_status, version struct, etc.)
 * Appliance-specific `std::optional<T>` fields for each sensor key
 
-The lambdas check `s.valid`, `s.<field>.has_value()` and publish to entities - no `json::parse_json` calls, no `is<T>()` / `as<T>()` key fishing.
+The per-appliance hubs check `s.valid`, `s.<field>.has_value()` and publish to entities - no `json::parse_json` calls, no `is<T>()` / `as<T>()` key fishing.
 
 === Running the Host Tests
 
-A CMake + GoogleTest harness at `tests/cpp/` compiles the parser on the host and runs ~35 tests (22 fixture-based + a dozen targeted behavior tests). Fixtures live at `tests/fixtures/` - one `.json` + one `.expected.json` per captured BLE payload.
+A CMake + GoogleTest harness at `tests/cpp/` compiles the parser, message buffer, commands, and the full hub state machine on the host and runs 200+ tests (fixture-based parser tests plus targeted behavior tests for the buffer, dispatch, and reconnect logic). Fixtures live at `tests/fixtures/` - one `.json` + one `.expected.json` per captured BLE payload.
 
 [source,bash]
 ----

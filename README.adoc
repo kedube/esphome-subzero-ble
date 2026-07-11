@@ -184,6 +184,7 @@ subzero_appliance:
 | `hide_ref_drawer` | `true` | Refrigerator Drawer Set Temperature, Refrigerator Drawer Door
 | `hide_crisper` | `true` | Crisper Drawer Set Temperature
 | `hide_air_filter` | `true` | Air Filter, Air Filter Remaining
+| `hide_air_filter_extra` | `true` | Air Filter Expires (set false on models that expose it)
 | `hide_water_filter` | `true` | Water Filter Remaining (%)
 | `hide_water_filter_extra` | `true` | Water Filter Gallons Remaining, Water Filter Expires (set false on models that expose these)
 | `hide_softener` | `true` | Water Softener Low (dishwasher only)
@@ -291,8 +292,8 @@ TIP: Sub-Zero appliance BLE MAC addresses typically begin with `00:06:80`. You c
 | *Most sensors stuck at "unknown" / Status sensor reads "Pairing required"*
 | The appliance returned `status: 302` to the unlock attempt. This usually means its PIN rotated - some appliances assign a new pairing key after a power cycle, factory reset, or when the official app re-pairs. Press the *Start Pairing* button for that appliance in HA, watch the appliance display for the new 6-digit PIN, then enter it into the appliance's *PIN* text input in HA. The next poll cycle will pick up full state. (You'll also see `[szg:###]: [Appliance] Pairing rejected (status 302)` in the ESPHome logs.)
 
-| *Poll-only sensors (model, uptime, version, diagnostic_status) only refresh every few minutes on a fridge or wall oven*
-| Normal for fw 8.5 appliances. After the first poll on each connection, repeat polls go silent within the same BLE session, so the integration's zombie detector forces a reconnect every ~3 missed cycles (~3 min). Each reconnect lands a fresh full-state poll which refreshes those fields. Push notifications (door, light, setpoint changes, etc.) continue between cycles, so live state stays current. See link:docs/advanced.adoc#reconnect-logic[Reconnect Logic].
+| *Poll-only sensors (model, uptime, version, diagnostic_status) only refresh every ~18 minutes on a fridge or wall oven*
+| Normal for fw 8.5 appliances. After the first poll on each connection, repeat polls go silent within the same BLE session. The integration proactively refreshes the session on a ~18-minute schedule (disconnect + fast reconnect), and each refresh lands a fresh full-state poll which updates those fields. In between, the logs show `miss=N` counting the silent polls - that counter is diagnostic-only and does not trigger a reconnect. Push notifications (door, light, setpoint changes, etc.) continue between cycles, so live state stays current. Also note: unchanged values are not re-published to HA, so `last_updated` on static sensors (model, serial, firmware versions) only advances when the value actually changes. See link:docs/advanced.adoc#reconnect-logic[Reconnect Logic].
 
 | *Dishwasher disconnects after ~10 seconds*
 | Normal for Cove dishwashers. The integration uses a fast reconnect path with cached GATT handles to complete polling within the connection window.

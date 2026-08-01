@@ -5,6 +5,7 @@
 #include "esp_idf_transport.h"
 #include "esphome_scheduler.h"
 #include "hub.h"
+#include "write_queue.h"
 
 #include "../subzero_protocol/dispatch_esphome.h"
 
@@ -19,7 +20,6 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 
-#include <deque>
 #include <functional>
 #include <string>
 #include <utility>
@@ -131,36 +131,20 @@ public:
 
   // Used by every writable entity (switches, numbers, selects) when HA
   // writes a value. All three enqueue rather than writing immediately —
-  // see enqueue_write() below for why.
+  // pacing, same-key coalescing, and the queue bound all live in
+  // WriteQueue (write_queue.h); enqueue_write_() below adds the drop
+  // logging that WriteQueue deliberately leaves to its caller.
   void enqueue_write_bool(const std::string &key, bool value) {
-    enqueue_write([this, key, value]() { hub()->write_set_bool(key, value); });
+    enqueue_write_(key,
+                   [this, key, value]() { hub()->write_set_bool(key, value); });
   }
   void enqueue_write_int(const std::string &key, int value) {
-    enqueue_write([this, key, value]() { hub()->write_set_int(key, value); });
+    enqueue_write_(key,
+                   [this, key, value]() { hub()->write_set_int(key, value); });
   }
   void enqueue_write_string(const std::string &key, const std::string &value) {
-    enqueue_write(
-        [this, key, value]() { hub()->write_set_string(key, value); });
-  }
-
-  // Queues one BLE write, draining one write per timeout tick rather than
-  // firing immediately. Live testing showed that issuing several BLE
-  // writes in the same loop iteration — whether from one grouped-select
-  // mode change or from two unrelated entities toggled close together —
-  // could overwhelm the stack and drop or corrupt one of them. Every
-  // writable entity goes through this single queue so the pacing
-  // protection isn't limited to grouped selects. A deque (rather than
-  // overwriting a single pending batch) lets writes queued from different
-  // entities interleave in FIFO order without clobbering each other.
-  //
-  // Pacing is enforced against the last write's timestamp (not just "is
-  // the queue non-empty"), so two writes arriving a few ms apart but each
-  // finding an empty queue — e.g. two unrelated entities toggled close
-  // together, neither queued behind the other — still get spaced out
-  // instead of firing back-to-back.
-  void enqueue_write(std::function<void()> write_fn) {
-    write_queue_.push_back(std::move(write_fn));
-    schedule_drain_();
+    enqueue_write_(
+        key, [this, key, value]() { hub()->write_set_string(key, value); });
   }
 
   // Used by ApplianceSetGroupedSelect when a mode picker needs to write
@@ -208,42 +192,13 @@ protected:
   esphome::switch_::Switch *debug_switch_ = nullptr;
 
 private:
-  // See enqueue_write() above.
-  static constexpr std::uint32_t kWriteSpacingMs = 750;
-  std::deque<std::function<void()>> write_queue_;
-  std::uint32_t last_write_ms_ = 0;
-  bool drain_scheduled_ = false;
-  bool have_written_ = false;
+  // Routes through write_queue_ and logs the one outcome WriteQueue
+  // can't report itself: a dropped write (queue full). Defined in
+  // appliance_base.cpp for access to ESP_LOGW.
+  void enqueue_write_(const std::string &key, std::function<void()> write_fn);
 
-  // Schedules drain_write_queue_() for whenever kWriteSpacingMs has
-  // elapsed since the last write (immediately, if it already has, or if
-  // this is the first write since boot). No-ops if a drain is already
-  // scheduled or the queue is empty, so this is safe to call after every
-  // enqueue and after every drain.
-  void schedule_drain_() {
-    if (drain_scheduled_ || write_queue_.empty())
-      return;
-    const std::uint32_t now = esphome::millis();
-    const std::uint32_t elapsed = now - last_write_ms_;
-    const std::uint32_t delay = (have_written_ && elapsed < kWriteSpacingMs)
-                                     ? (kWriteSpacingMs - elapsed)
-                                     : 0;
-    drain_scheduled_ = true;
-    this->set_timeout("subzero_write_queue", delay,
-                       [this]() { this->drain_write_queue_(); });
-  }
-
-  void drain_write_queue_() {
-    drain_scheduled_ = false;
-    if (write_queue_.empty())
-      return;
-    auto write_fn = std::move(write_queue_.front());
-    write_queue_.pop_front();
-    last_write_ms_ = esphome::millis();
-    have_written_ = true;
-    write_fn();
-    schedule_drain_();
-  }
+  // Paced/coalescing/bounded write queue; scheduler wired in setup().
+  WriteQueue write_queue_;
 };
 
 // One Button subclass for all 7 button actions. Python codegen

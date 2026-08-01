@@ -67,6 +67,7 @@ add_executable(protocol_tests
   dispatch_test.cpp
   hub_test.cpp
   lifecycle_guards_test.cpp
+  write_queue_test.cpp
 )
 target_link_libraries(protocol_tests PRIVATE
   subzero_protocol

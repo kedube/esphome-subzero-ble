@@ -13,6 +13,7 @@ static const char *const TAG = "subzero_appliance";
 void ApplianceBase::setup() {
   transport_.set_client(this->parent());
   scheduler_.set_component(this);
+  write_queue_.set_scheduler(&scheduler_);
 
   wire_bus_();
 
@@ -111,6 +112,21 @@ void ApplianceBase::press_connect() {
 }
 
 void ApplianceBase::press_disconnect() { transport_.disconnect(); }
+
+void ApplianceBase::enqueue_write_(const std::string &key,
+                                   std::function<void()> write_fn) {
+  const auto result = write_queue_.enqueue(key, std::move(write_fn));
+  if (result == WriteQueue::Enqueue::kDropped) {
+    // Deliberately omit the value — this path also carries
+    // remote_svc_reg_token (the "Clear Cloud Token" button), matching
+    // the value-free drop log in write_set_property_.
+    ESP_LOGW(TAG,
+             "[%s] Dropping write to %s: queue full (%u pending) — is an "
+             "automation hammering a writable entity?",
+             name_str_.c_str(), key.c_str(),
+             static_cast<unsigned>(write_queue_.pending()));
+  }
+}
 
 void ApplianceBase::press_log_debug_info() {
   if (debug_switch_ != nullptr) {

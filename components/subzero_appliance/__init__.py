@@ -54,7 +54,6 @@ from esphome.const import (
     CONF_ESPHOME,
     CONF_ICON,
     CONF_ID,
-    CONF_INTERNAL,
     CONF_MODE,
     CONF_NAME,
     CONF_PIN,
@@ -119,6 +118,7 @@ CONF_PIN_INPUT = "pin_input_id"
 CONF_DEBUG_SWITCH = "debug_switch_id"
 CONF_STATUS = "status_id"
 CONF_POLL_OFFSET = "poll_offset"
+CONF_POLL_INTERVAL = "poll_interval"
 
 # ----------------------------------------------------------------------
 # Sensor descriptors — compact form so we can iterate and generate via
@@ -273,8 +273,10 @@ BUTTON_DEFINITIONS = [
 ]
 
 # Per-type sensor descriptors. Each entry: (suffix, name_suffix, setter, kwargs, hide_key_or_None).
-# `hide_key_or_None` when set means the sensor's `internal:` flag mirrors the
-# user's `hide_X: true|false` config (default true → hidden).
+# `hide_key_or_None` when set means the entity is only built when the user's
+# `hide_X` config is false (most default true → not built at all — the C++
+# bus pointer stays nullptr and publish_if skips it, so a hidden entity
+# costs no RAM, flash, or publish work).
 
 FRIDGE_BINARY_SENSORS = [
     (
@@ -1353,6 +1355,9 @@ def _schema_for_type(type_: str) -> cv.Schema:
         cv.Optional(
             CONF_POLL_OFFSET, default="0s"
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(
+            CONF_POLL_INTERVAL, default="60s"
+        ): cv.positive_time_period_milliseconds,
     }
     base.update(TYPE_SCHEMAS[type_])
     return (
@@ -1419,39 +1424,33 @@ def _validate_text_sensor(cfg):
     return text_sensor.text_sensor_schema()(cfg)
 
 
-def _build_sensor_config(parent_id, suffix, name_suffix, kwargs, hidden):
+def _build_sensor_config(parent_id, suffix, name_suffix, kwargs):
     cfg = {
         CONF_ID: _entity_id(parent_id, suffix, sensor.Sensor),
         CONF_NAME: f"{name_suffix}",
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg.update(kwargs)
-    if hidden:
-        cfg[CONF_INTERNAL] = True
     return _validate_sensor(cfg)
 
 
-def _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs, hidden):
+def _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs):
     cfg = {
         CONF_ID: _entity_id(parent_id, suffix, binary_sensor.BinarySensor),
         CONF_NAME: f"{name_suffix}",
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg.update(kwargs)
-    if hidden:
-        cfg[CONF_INTERNAL] = True
     return _validate_binary_sensor(cfg)
 
 
-def _build_text_sensor_config(parent_id, suffix, name_suffix, kwargs, hidden):
+def _build_text_sensor_config(parent_id, suffix, name_suffix, kwargs):
     cfg = {
         CONF_ID: _entity_id(parent_id, suffix, text_sensor.TextSensor),
         CONF_NAME: f"{name_suffix}",
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg.update(kwargs)
-    if hidden:
-        cfg[CONF_INTERNAL] = True
     return _validate_text_sensor(cfg)
 
 
@@ -1464,7 +1463,7 @@ def _resolve_hidden(config, hide_key):
 
 
 async def _build_set_switch(
-    parent_id, parent_var, suffix, name_suffix, property_key, kwargs, hidden
+    parent_id, parent_var, suffix, name_suffix, property_key, kwargs
 ):
     """Instantiates an ApplianceSetSwitch HA entity, wires the parent +
     property_key, and registers it. Caller binds the bus pointer via the
@@ -1476,8 +1475,6 @@ async def _build_set_switch(
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg_raw.update(kwargs)
-    if hidden:
-        cfg_raw[CONF_INTERNAL] = True
     cfg = switch.switch_schema(ApplianceSetSwitch)(cfg_raw)
     sw = await switch.new_switch(cfg)
     cg.add(sw.set_parent(parent_var))
@@ -1486,7 +1483,7 @@ async def _build_set_switch(
 
 
 async def _build_set_int_switch(
-    parent_id, parent_var, suffix, name_suffix, property_key, kwargs, hidden
+    parent_id, parent_var, suffix, name_suffix, property_key, kwargs
 ):
     """Like _build_set_switch, but for properties whose wire format is an
     int (0/1) rather than a JSON boolean literal — see ApplianceSetIntSwitch."""
@@ -1496,8 +1493,6 @@ async def _build_set_int_switch(
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg_raw.update(kwargs)
-    if hidden:
-        cfg_raw[CONF_INTERNAL] = True
     cfg = switch.switch_schema(ApplianceSetIntSwitch)(cfg_raw)
     sw = await switch.new_switch(cfg)
     cg.add(sw.set_parent(parent_var))
@@ -1515,7 +1510,6 @@ async def _build_set_number(
     max_value,
     step,
     kwargs,
-    hidden,
 ):
     """Instantiates an ApplianceSetNumber HA entity, wires the parent +
     property_key, and registers it with min/max/step traits."""
@@ -1525,8 +1519,6 @@ async def _build_set_number(
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg_raw.update(kwargs)
-    if hidden:
-        cfg_raw[CONF_INTERNAL] = True
     cfg = number.number_schema(ApplianceSetNumber)(cfg_raw)
     n = await number.new_number(
         cfg,
@@ -1540,7 +1532,7 @@ async def _build_set_number(
 
 
 async def _build_set_int_select(
-    parent_id, parent_var, suffix, name_suffix, property_key, value_mappings, hidden
+    parent_id, parent_var, suffix, name_suffix, property_key, value_mappings
 ):
     """Instantiates an ApplianceSetIntSelect HA entity backed by a single
     int property. value_mappings is [(label, int_value), ...] — each
@@ -1550,8 +1542,6 @@ async def _build_set_int_select(
         CONF_NAME: name_suffix,
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
-    if hidden:
-        cfg_raw[CONF_INTERNAL] = True
     cfg = select.select_schema(ApplianceSetIntSelect)(cfg_raw)
     options = [label for label, _value in value_mappings]
     s = await select.new_select(cfg, options=options)
@@ -1563,7 +1553,7 @@ async def _build_set_int_select(
 
 
 async def _build_set_grouped_select(
-    parent_id, parent_var, suffix, name_suffix, option_mappings, hidden
+    parent_id, parent_var, suffix, name_suffix, option_mappings
 ):
     """Instantiates an ApplianceSetGroupedSelect HA entity. option_mappings
     is [(label, [(property_key, bool_value), ...]), ...] — selecting a
@@ -1576,8 +1566,6 @@ async def _build_set_grouped_select(
         CONF_NAME: name_suffix,
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
-    if hidden:
-        cfg_raw[CONF_INTERNAL] = True
     cfg = select.select_schema(ApplianceSetGroupedSelect)(cfg_raw)
     options = [label for label, _writes in option_mappings]
     s = await select.new_select(cfg, options=options)
@@ -1605,6 +1593,7 @@ async def to_code(config):
     cg.add(var.set_appliance_name(name))
     cg.add(var.set_pin(config[CONF_PIN]))
     cg.add(var.set_poll_offset_ms(config[CONF_POLL_OFFSET]))
+    cg.add(var.set_poll_interval_ms(config[CONF_POLL_INTERVAL]))
 
     # ---- Status text sensor ----
     status_cfg = _validate_text_sensor(
@@ -1619,17 +1608,13 @@ async def to_code(config):
 
     # ---- Common binary sensors ----
     for suffix, name_suffix, setter, kwargs in COMMON_BINARY_SENSORS:
-        cfg = _build_binary_sensor_config(
-            parent_id, suffix, name_suffix, kwargs, False
-        )
+        cfg = _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs)
         bs = await binary_sensor.new_binary_sensor(cfg)
         cg.add(getattr(var, setter)(bs))
 
     # ---- Common text sensors ----
     for suffix, name_suffix, setter, kwargs in COMMON_TEXT_SENSORS:
-        cfg = _build_text_sensor_config(
-            parent_id, suffix, name_suffix, kwargs, False
-        )
+        cfg = _build_text_sensor_config(parent_id, suffix, name_suffix, kwargs)
         ts = await text_sensor.new_text_sensor(cfg)
         cg.add(getattr(var, setter)(ts))
 
@@ -1662,64 +1647,41 @@ async def to_code(config):
         n_list = RANGE_WRITABLE_NUMBERS
 
     for suffix, name_suffix, setter, kwargs, hide_key in bs_list:
-        cfg = _build_binary_sensor_config(
-            parent_id,
-            suffix,
-            name_suffix,
-            kwargs,
-            _resolve_hidden(config, hide_key),
-        )
+        if _resolve_hidden(config, hide_key):
+            continue
+        cfg = _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs)
         bs = await binary_sensor.new_binary_sensor(cfg)
         cg.add(getattr(var, setter)(bs))
 
     for suffix, name_suffix, setter, kwargs, hide_key in s_list:
-        cfg = _build_sensor_config(
-            parent_id,
-            suffix,
-            name_suffix,
-            kwargs,
-            _resolve_hidden(config, hide_key),
-        )
+        if _resolve_hidden(config, hide_key):
+            continue
+        cfg = _build_sensor_config(parent_id, suffix, name_suffix, kwargs)
         s = await sensor.new_sensor(cfg)
         cg.add(getattr(var, setter)(s))
 
     for suffix, name_suffix, setter, kwargs, hide_key in ts_list:
-        cfg = _build_text_sensor_config(
-            parent_id,
-            suffix,
-            name_suffix,
-            kwargs,
-            _resolve_hidden(config, hide_key),
-        )
+        if _resolve_hidden(config, hide_key):
+            continue
+        cfg = _build_text_sensor_config(parent_id, suffix, name_suffix, kwargs)
         ts = await text_sensor.new_text_sensor(cfg)
         cg.add(getattr(var, setter)(ts))
 
     # Writable switches — HA-toggled booleans that send `set` on D5.
     for suffix, name_suffix, setter, prop_key, kwargs, hide_key in sw_list:
+        if _resolve_hidden(config, hide_key):
+            continue
         sw = await _build_set_switch(
-            parent_id,
-            var,
-            suffix,
-            name_suffix,
-            prop_key,
-            kwargs,
-            _resolve_hidden(config, hide_key),
+            parent_id, var, suffix, name_suffix, prop_key, kwargs
         )
         cg.add(getattr(var, setter)(sw))
 
     # Writable numbers — HA-set numerics (set temps, etc.) that send `set`.
     for suffix, name_suffix, setter, prop_key, mn, mx, step, kwargs, hide_key in n_list:
+        if _resolve_hidden(config, hide_key):
+            continue
         n = await _build_set_number(
-            parent_id,
-            var,
-            suffix,
-            name_suffix,
-            prop_key,
-            mn,
-            mx,
-            step,
-            kwargs,
-            _resolve_hidden(config, hide_key),
+            parent_id, var, suffix, name_suffix, prop_key, mn, mx, step, kwargs
         )
         cg.add(getattr(var, setter)(n))
 
@@ -1734,14 +1696,10 @@ async def to_code(config):
             kwargs,
             hide_key,
         ) in FRIDGE_TEMP_INT_SWITCHES:
+            if _resolve_hidden(config, hide_key):
+                continue
             isw = await _build_set_int_switch(
-                parent_id,
-                var,
-                suffix,
-                name_suffix,
-                prop_key,
-                kwargs,
-                _resolve_hidden(config, hide_key),
+                parent_id, var, suffix, name_suffix, prop_key, kwargs
             )
             cg.add(getattr(var, setter)(isw))
 
@@ -1749,13 +1707,10 @@ async def to_code(config):
     # TYPE_SCHEMAS comment for confirmation status.
     if type_ == "fridge" and config.get("enable_mode_selects"):
         for suffix, name_suffix, setter, options, hide_key in FRIDGE_GROUPED_SELECTS:
+            if _resolve_hidden(config, hide_key):
+                continue
             gs = await _build_set_grouped_select(
-                parent_id,
-                var,
-                suffix,
-                name_suffix,
-                options,
-                _resolve_hidden(config, hide_key),
+                parent_id, var, suffix, name_suffix, options
             )
             cg.add(getattr(var, setter)(gs))
 
@@ -1767,14 +1722,10 @@ async def to_code(config):
             options,
             hide_key,
         ) in FRIDGE_INT_SELECTS:
+            if _resolve_hidden(config, hide_key):
+                continue
             iselect = await _build_set_int_select(
-                parent_id,
-                var,
-                suffix,
-                name_suffix,
-                prop_key,
-                options,
-                _resolve_hidden(config, hide_key),
+                parent_id, var, suffix, name_suffix, prop_key, options
             )
             cg.add(getattr(var, setter)(iselect))
 

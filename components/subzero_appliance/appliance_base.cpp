@@ -39,11 +39,12 @@ void ApplianceBase::setup() {
         [pi](const std::string &pin) { pi->publish_state(pin); });
   }
 
-  this->set_interval("subzero_periodic_poll", 60000,
+  this->set_interval("subzero_periodic_poll", poll_interval_ms_,
                      [this]() { hub()->do_periodic_poll(); });
 
-  ESP_LOGCONFIG(TAG, "[%s] Hub setup complete (poll_offset=%dms)",
-                name_str_.c_str(), static_cast<int>(poll_offset_ms_));
+  ESP_LOGCONFIG(TAG, "[%s] Hub setup complete (poll_offset=%dms, poll_interval=%dms)",
+                name_str_.c_str(), static_cast<int>(poll_offset_ms_),
+                static_cast<int>(poll_interval_ms_));
 }
 
 float ApplianceBase::get_setup_priority() const {

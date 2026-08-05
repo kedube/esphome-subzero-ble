@@ -47,6 +47,7 @@ public:
   void set_pin(const std::string &pin) { pending_pin_ = pin; }
   void set_appliance_name(const std::string &name) { name_str_ = name; }
   void set_poll_offset_ms(std::uint32_t ms) { poll_offset_ms_ = ms; }
+  void set_poll_interval_ms(std::uint32_t ms) { poll_interval_ms_ = ms; }
 
   // Status / PIN entities
   void set_status_text_sensor(esphome::text_sensor::TextSensor *s) {
@@ -185,6 +186,7 @@ protected:
   std::string pending_pin_;
   std::string name_str_;
   std::uint32_t poll_offset_ms_ = 0;
+  std::uint32_t poll_interval_ms_ = 60000;
 
   // Entity refs (set from Python codegen)
   esphome::text_sensor::TextSensor *status_ts_ = nullptr;
@@ -423,17 +425,20 @@ public:
 
 protected:
   void control(const std::string &value) override {
-    if (parent_ != nullptr) {
-      std::vector<std::pair<std::string, bool>> writes;
-      for (auto &entry : writes_) {
-        if (entry.first == value) {
-          writes.push_back(entry.second);
-        }
-      }
-      if (!writes.empty()) {
-        parent_->write_set_bool_sequence(std::move(writes));
+    std::vector<std::pair<std::string, bool>> writes;
+    for (auto &entry : writes_) {
+      if (entry.first == value) {
+        writes.push_back(entry.second);
       }
     }
+    // Unknown label (no registered writes): don't publish a state that
+    // was never sent to the appliance. Codegen keeps option labels and
+    // add_write() registrations in sync, so this is a guard against a
+    // silent desync ever showing HA an option the appliance never
+    // received, not an expected path.
+    if (writes.empty() || parent_ == nullptr)
+      return;
+    parent_->write_set_bool_sequence(std::move(writes));
     this->publish_state(value);
   }
 

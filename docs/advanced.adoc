@@ -116,7 +116,7 @@ If you experience crashes (typically `__cxa_allocate_exception` -> `operator new
 
 . Reducing the number of Home Assistant API connections to the device
 . Setting `ble_client: WARN` in the logger config
-. Lengthening the poll interval (default `60s`, set in the hub) to `120s` or `300s`
+. Lengthening the poll interval (default `60s`, via `poll_interval:` on the `subzero_appliance:` entry) to `120s` or `300s`
 
 [[reconnect-logic]]
 == Reconnect Logic
@@ -162,7 +162,7 @@ Separately, when the BLE connection drops and `auto_connect: true` reconnects, t
 
 === Tuning
 
-* `interval: 60s` in the hub - poll cadence. Shortening to 30s doubles radio utilization (still single-digit percent for typical configs).
+* `poll_interval` per appliance (default `60s`) - poll cadence. Shortening to 30s doubles radio utilization (still single-digit percent for typical configs).
 * `kSessionRefreshIntervalMs` (18 min, in `hub.h`) - session-refresh cadence. Must stay below the firmware's ~20-25 min unlock-session expiry.
 * `poll_offset` per appliance - boot stagger. `0s` for first, `5s` or `10s` for subsequent appliances on the same ESP32.
 

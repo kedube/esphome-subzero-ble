@@ -158,7 +158,7 @@ TIP: Pin to a release tag (e.g. `ref: v3.7.0`) for stability, or use `ref: main`
 
 ==== Fridge-Only Options
 
-For units without a freezer or ice maker, you can hide irrelevant sensors. The `hide_X` flags are inline options on the `subzero_appliance:` entry:
+For units without a freezer or ice maker, you can hide irrelevant sensors. The `hide_X` flags are inline options on the `subzero_appliance:` entry. Hidden entities are not built into the firmware at all (rather than built-but-internal), so hiding sensors you don't need also saves device RAM and flash:
 
 [source,yaml]
 ----

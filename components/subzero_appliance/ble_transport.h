@@ -31,6 +31,10 @@ struct GattDbEntry {
   Type type = kOther;
   bool uuid_is_128bit = false;
   std::uint8_t uuid_first_byte = 0;
+  // 16-bit UUID when uuid_is_128bit is false (0 otherwise). Used to
+  // locate 0x2902 CCCD descriptors instead of assuming they sit at
+  // `characteristic handle + 2`.
+  std::uint16_t uuid16 = 0;
   std::uint16_t handle = 0;
 };
 

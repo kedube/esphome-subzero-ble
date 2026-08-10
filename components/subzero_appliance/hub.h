@@ -69,6 +69,21 @@ public:
   void handle_d5_notify(const std::uint8_t *data, std::size_t len);
   void handle_d6_notify(const std::uint8_t *data, std::size_t len);
 
+  // Asynchronous GATT write failure (ESP_GATTC_WRITE_CHAR_EVT /
+  // WRITE_DESCR_EVT with status != OK). esp_ble_gattc_write_char returns
+  // ESP_OK synchronously even when the handle no longer exists on the
+  // peer (e.g. the appliance rebooted with a different GATT layout), so
+  // this event is the only place stale cached handles ever surface. A
+  // streak of failures forces a cold rediscovery.
+  void handle_write_failed(std::uint16_t handle);
+
+  // Mark the next disconnect as deliberate (user pressed Disconnect, a
+  // debug-triggered reconnect, etc.) so handle_disconnected() skips
+  // stale-bond accounting. Without this, a few manual Disconnect presses
+  // without an intervening successful parse would hit
+  // kStaleBondsThreshold and wrongly wipe a healthy bond.
+  void notify_intentional_disconnect() { intentional_disconnect_ = true; }
+
   // 60s interval tick (called from interval block).
   void do_periodic_poll();
 
@@ -147,7 +162,8 @@ public:
   int fast_retries() const { return fast_retries_; }
   std::uint16_t d5_handle() const { return d5_handle_; }
   std::uint16_t d6_handle() const { return d6_handle_; }
-  std::uint16_t d7_handle() const { return d7_handle_; }
+  std::uint16_t d5_cccd_handle() const { return d5_cccd_handle_; }
+  std::uint16_t d6_cccd_handle() const { return d6_cccd_handle_; }
   int phase() const { return phase_; }
   bool debug_mode() const { return debug_mode_; }
   bool post_bond_running() const { return post_bond_running_; }
@@ -256,7 +272,12 @@ private:
   int phase_ = 0;
   std::uint16_t d5_handle_ = 0;
   std::uint16_t d6_handle_ = 0;
-  std::uint16_t d7_handle_ = 0;
+  // CCCD descriptor handles located from the GATT db (the 0x2902
+  // descriptor following each characteristic). Falls back to the
+  // battle-tested `char handle + 2` layout assumption when the snapshot
+  // didn't include them.
+  std::uint16_t d5_cccd_handle_ = 0;
+  std::uint16_t d6_cccd_handle_ = 0;
   std::string stored_pin_;
   // Cached unlock_channel command for stored_pin_. Rebuilt lazily by
   // write_unlock_channel_ and invalidated (cleared) whenever stored_pin_
@@ -277,6 +298,17 @@ private:
   bool last_lacking_properties_ = false;
   int fast_retries_ = 0;
   int poll_miss_ = 0;
+  // Consecutive async GATT write failures this session — see
+  // handle_write_failed(). Reset on disconnect and on any successfully
+  // parsed message.
+  int write_fail_streak_ = 0;
+  // Consecutive sessions that reached subscribe with no D6 handle — see
+  // subscribe_initial_get_(). Reset when D6 is found and on full resets.
+  int d6_missing_streak_ = 0;
+  // json_buf_ byte count observed at the previous poll tick; used to
+  // detect a stale (no-progress) assembly buffer without clobbering a
+  // push that is actively assembling. See do_periodic_poll().
+  std::size_t last_poll_buf_bytes_ = 0;
   bool debug_mode_ = false;
   std::uint32_t poll_offset_ms_ = 0;
   esphome::subzero_protocol::PollVerb poll_verb_ =
@@ -318,6 +350,13 @@ private:
   static constexpr std::uint32_t kResetPairingDisconnectDelayMs = 1000;
   static constexpr int kStaleBondsThreshold = 3;
   static constexpr std::uint32_t kVerbFallbackRetryDelayMs = 1000;
+  // Async write failures tolerated before assuming the cached handles are
+  // stale and forcing a cold rediscovery.
+  static constexpr int kWriteFailStreakThreshold = 3;
+  // Reconnect-for-rediscovery attempts when the GATT snapshot has D5 but
+  // no D6 (truncated mid-fill); after this, polling is parked until the
+  // session-refresh reconnect retries discovery.
+  static constexpr int kMaxD6RediscoverAttempts = 2;
 };
 
 } // namespace subzero_appliance

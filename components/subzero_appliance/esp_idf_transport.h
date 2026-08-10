@@ -127,6 +127,8 @@ public:
       }
       e.uuid_is_128bit = (db[i].uuid.len == ESP_UUID_LEN_128);
       e.uuid_first_byte = e.uuid_is_128bit ? db[i].uuid.uuid.uuid128[0] : 0;
+      e.uuid16 =
+          (db[i].uuid.len == ESP_UUID_LEN_16) ? db[i].uuid.uuid.uuid16 : 0;
       e.handle = db[i].attribute_handle;
       out.push_back(e);
     }

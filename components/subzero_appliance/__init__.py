@@ -114,9 +114,6 @@ ApplianceSetGroupedSelect = subzero_appliance_ns.class_(
 AppliancePinText = subzero_appliance_ns.class_("AppliancePinText", text.Text)
 ApplianceButtonKind = subzero_appliance_ns.enum("ApplianceButtonKind", is_class=True)
 
-CONF_PIN_INPUT = "pin_input_id"
-CONF_DEBUG_SWITCH = "debug_switch_id"
-CONF_STATUS = "status_id"
 CONF_POLL_OFFSET = "poll_offset"
 CONF_POLL_INTERVAL = "poll_interval"
 
@@ -460,6 +457,7 @@ FRIDGE_SENSORS = [
         "Door Ajar Alarm Timeout",
         "set_door_ajar_timeout_sensor",
         {
+            CONF_UNIT_OF_MEASUREMENT: "min",
             CONF_ICON: "mdi:door-open",
             "accuracy_decimals": 0,
             CONF_ENTITY_CATEGORY: ENTITY_CATEGORY_DIAGNOSTIC,
@@ -1347,17 +1345,36 @@ TYPE_TO_CLASS = {
 }
 
 
+def _validate_pin(value):
+    """Appliance PINs are numeric BLE passkeys (the hub converts with atoi
+    and the parser only accepts digits). Catch a bad PIN at config time
+    instead of a silent passkey-0 pairing failure at runtime."""
+    value = cv.string_strict(value)
+    if not value.isdigit():
+        raise cv.Invalid(
+            "pin must contain only digits (it is used as the BLE pairing "
+            "passkey)"
+        )
+    if len(value) > 10:
+        raise cv.Invalid("pin must be at most 10 digits")
+    return value
+
+
 def _schema_for_type(type_: str) -> cv.Schema:
     base = {
         cv.GenerateID(): cv.declare_id(TYPE_TO_CLASS[type_]),
         cv.Required(CONF_NAME): cv.string,
-        cv.Required(CONF_PIN): cv.string,
+        cv.Required(CONF_PIN): _validate_pin,
         cv.Optional(
             CONF_POLL_OFFSET, default="0s"
         ): cv.positive_time_period_milliseconds,
-        cv.Optional(
-            CONF_POLL_INTERVAL, default="60s"
-        ): cv.positive_time_period_milliseconds,
+        # not_null: poll_interval 0s would pass set_interval(0), which
+        # fires every main-loop pass — an unlock + poll write per loop
+        # iteration floods the BLE link and the appliance.
+        cv.Optional(CONF_POLL_INTERVAL, default="60s"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.positive_not_null_time_period,
+        ),
     }
     base.update(TYPE_SCHEMAS[type_])
     return (
@@ -1424,34 +1441,35 @@ def _validate_text_sensor(cfg):
     return text_sensor.text_sensor_schema()(cfg)
 
 
-def _build_sensor_config(parent_id, suffix, name_suffix, kwargs):
+def _build_entity_config(parent_id, suffix, name_suffix, kwargs, entity_class,
+                         validate):
     cfg = {
-        CONF_ID: _entity_id(parent_id, suffix, sensor.Sensor),
+        CONF_ID: _entity_id(parent_id, suffix, entity_class),
         CONF_NAME: f"{name_suffix}",
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg.update(kwargs)
-    return _validate_sensor(cfg)
+    return validate(cfg)
+
+
+def _build_sensor_config(parent_id, suffix, name_suffix, kwargs):
+    return _build_entity_config(
+        parent_id, suffix, name_suffix, kwargs, sensor.Sensor, _validate_sensor
+    )
 
 
 def _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs):
-    cfg = {
-        CONF_ID: _entity_id(parent_id, suffix, binary_sensor.BinarySensor),
-        CONF_NAME: f"{name_suffix}",
-        CONF_DEVICE_ID: _subdevice_id(parent_id),
-    }
-    cfg.update(kwargs)
-    return _validate_binary_sensor(cfg)
+    return _build_entity_config(
+        parent_id, suffix, name_suffix, kwargs, binary_sensor.BinarySensor,
+        _validate_binary_sensor,
+    )
 
 
 def _build_text_sensor_config(parent_id, suffix, name_suffix, kwargs):
-    cfg = {
-        CONF_ID: _entity_id(parent_id, suffix, text_sensor.TextSensor),
-        CONF_NAME: f"{name_suffix}",
-        CONF_DEVICE_ID: _subdevice_id(parent_id),
-    }
-    cfg.update(kwargs)
-    return _validate_text_sensor(cfg)
+    return _build_entity_config(
+        parent_id, suffix, name_suffix, kwargs, text_sensor.TextSensor,
+        _validate_text_sensor,
+    )
 
 
 def _resolve_hidden(config, hide_key):
@@ -1462,24 +1480,34 @@ def _resolve_hidden(config, hide_key):
     return bool(config.get(hide_key, False))
 
 
-async def _build_set_switch(
-    parent_id, parent_var, suffix, name_suffix, property_key, kwargs
+async def _build_set_switch_of(
+    switch_class, parent_id, parent_var, suffix, name_suffix, property_key,
+    kwargs,
 ):
-    """Instantiates an ApplianceSetSwitch HA entity, wires the parent +
-    property_key, and registers it. Caller binds the bus pointer via the
-    setter on `parent_var` (e.g. `parent_var.set_cav_light_on_switch(s)`).
-    """
+    """Instantiates a writable-switch HA entity of the given class, wires
+    the parent + property_key, and registers it. Caller binds the bus
+    pointer via the setter on `parent_var` (e.g.
+    `parent_var.set_cav_light_on_switch(s)`)."""
     cfg_raw = {
-        CONF_ID: _entity_id(parent_id, suffix, ApplianceSetSwitch),
+        CONF_ID: _entity_id(parent_id, suffix, switch_class),
         CONF_NAME: name_suffix,
         CONF_DEVICE_ID: _subdevice_id(parent_id),
     }
     cfg_raw.update(kwargs)
-    cfg = switch.switch_schema(ApplianceSetSwitch)(cfg_raw)
+    cfg = switch.switch_schema(switch_class)(cfg_raw)
     sw = await switch.new_switch(cfg)
     cg.add(sw.set_parent(parent_var))
     cg.add(sw.set_property_key(property_key))
     return sw
+
+
+async def _build_set_switch(
+    parent_id, parent_var, suffix, name_suffix, property_key, kwargs
+):
+    return await _build_set_switch_of(
+        ApplianceSetSwitch, parent_id, parent_var, suffix, name_suffix,
+        property_key, kwargs,
+    )
 
 
 async def _build_set_int_switch(
@@ -1487,17 +1515,10 @@ async def _build_set_int_switch(
 ):
     """Like _build_set_switch, but for properties whose wire format is an
     int (0/1) rather than a JSON boolean literal — see ApplianceSetIntSwitch."""
-    cfg_raw = {
-        CONF_ID: _entity_id(parent_id, suffix, ApplianceSetIntSwitch),
-        CONF_NAME: name_suffix,
-        CONF_DEVICE_ID: _subdevice_id(parent_id),
-    }
-    cfg_raw.update(kwargs)
-    cfg = switch.switch_schema(ApplianceSetIntSwitch)(cfg_raw)
-    sw = await switch.new_switch(cfg)
-    cg.add(sw.set_parent(parent_var))
-    cg.add(sw.set_property_key(property_key))
-    return sw
+    return await _build_set_switch_of(
+        ApplianceSetIntSwitch, parent_id, parent_var, suffix, name_suffix,
+        property_key, kwargs,
+    )
 
 
 async def _build_set_number(

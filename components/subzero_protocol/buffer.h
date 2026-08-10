@@ -42,7 +42,14 @@ public:
 
   // Append bytes; return true once a complete message is buffered (a `}`
   // has brought running brace depth to 0). Sticky: once true, stays true
-  // through subsequent appends until clear()/take_message() resets state.
+  // through subsequent appends until clear()/consume() resets state.
+  // Trailing bytes past the completing `}` are retained verbatim: the D6
+  // channel is a byte stream with no message-aligned fragment boundaries,
+  // so one indication can carry message A's closing `}` plus the start of
+  // message B. consume() keeps that prefix of B instead of discarding it
+  // (the old clear-everything behavior orphaned B's opening `{`, leaving
+  // its later fragments with unbalanced braces that wedged depth tracking
+  // until the kMaxBytes flush — up to 4KB of silently lost messages).
   //
   // If the buffer was already over-capacity *before* this append, it is
   // reset first — same recovery semantics as the prior YAML lambda.
@@ -77,6 +84,7 @@ public:
           depth_--;
           if (depth_ == 0) {
             complete_ = true;
+            complete_end_ = buf_.size();
           }
         }
       }
@@ -86,11 +94,15 @@ public:
 
   // If a complete message is buffered, trim leading garbage (from ACL
   // corruption) in place and return a pointer to the internal buffer.
-  // The pointer stays valid until the next feed()/clear(); the caller
-  // processes the message and then calls clear(). If no message is
-  // complete returns nullptr; if no `{` exists the buffer is cleared as
-  // unrecoverable garbage and nullptr is returned (matches the prior
+  // The pointer stays valid until the next feed()/clear()/consume(); the
+  // caller processes the message and then calls consume(). If no message
+  // is complete returns nullptr; if no `{` exists the buffer is cleared
+  // as unrecoverable garbage and nullptr is returned (matches the prior
   // parse_json script behavior).
+  //
+  // The returned string may extend past the completing `}` (trailing
+  // bytes of the next message) — ArduinoJson stops reading at the end of
+  // the root object, so callers can hand the whole thing to the parser.
   //
   // This is the production path: compared to take_message() it avoids
   // copying the multi-KB message out on every poll response while still
@@ -106,11 +118,42 @@ public:
       return nullptr;
     }
     buf_.erase(0, start);
+    complete_end_ -= start;
     return &buf_;
   }
 
+  // Discard the completed message (everything up to and including its
+  // closing `}`), retain any trailing bytes as the start of the next
+  // message, and recompute brace depth over the retained tail. If the
+  // tail itself already holds a complete message, complete() is true
+  // again after this call — callers should loop.
+  inline void consume() {
+    if (!complete_) {
+      clear();
+      return;
+    }
+    buf_.erase(0, complete_end_);
+    depth_ = 0;
+    complete_ = false;
+    complete_end_ = 0;
+    for (std::size_t i = 0; i < buf_.size() && !complete_; i++) {
+      char c = buf_[i];
+      if (c == '{') {
+        depth_++;
+      } else if (c == '}') {
+        if (depth_ > 0) {
+          depth_--;
+          if (depth_ == 0) {
+            complete_ = true;
+            complete_end_ = i + 1;
+          }
+        }
+      }
+    }
+  }
+
   // Copying variant of message_in_place() — returns the message by value
-  // and resets state. Copies out (rather than moving buf_) so the
+  // and consumes it. Copies out (rather than moving buf_) so the
   // reserved capacity survives the reset; moving would leave buf_ with
   // capacity 0, forcing the kReserveHint reserve to reallocate the ~2KB
   // buffer on every message, which churns and fragments the ESP32 heap.
@@ -119,17 +162,18 @@ public:
     if (msg == nullptr) {
       return std::nullopt;
     }
-    std::string out(*msg);
-    clear();
+    std::string out(msg->substr(0, complete_end_));
+    consume();
     return out;
   }
 
-  // Manual reset (use on disconnect or when callers detect parse failure
-  // and want to discard the current buffer).
+  // Manual reset (use on disconnect or when callers detect the buffer is
+  // stale and want to discard everything, tail included).
   inline void clear() {
     buf_.clear();
     depth_ = 0;
     complete_ = false;
+    complete_end_ = 0;
   }
 
   std::size_t size() const { return buf_.size(); }
@@ -139,6 +183,10 @@ private:
   std::string buf_;
   int depth_ = 0;
   bool complete_ = false;
+  // One past the `}` that completed the current message (valid only while
+  // complete_ is true). Everything at or beyond this index belongs to the
+  // next message and survives consume().
+  std::size_t complete_end_ = 0;
 };
 
 } // namespace subzero_protocol

@@ -81,6 +81,19 @@ inline void publish_if(esphome::text_sensor::TextSensor *s,
   s->publish_state(v);
 }
 
+// Select doesn't dedupe in the framework either — and the derived selects
+// below are recomputed once per *contributing field*, so a full poll
+// would otherwise re-publish appliance_mode 4x and ice_maker_mode 3x per
+// cycle (each firing callbacks, a log line, an API message, and an HA
+// history row).
+inline void publish_if(esphome::select::Select *s, const std::string &v) {
+  if (s == nullptr)
+    return;
+  if (s->has_state() && s->state == v)
+    return;
+  s->publish_state(v);
+}
+
 } // namespace detail
 
 // Common (appliance-agnostic) bus. Inherited by every appliance bus.
@@ -255,7 +268,7 @@ struct FridgeBus : CommonBus {
       label = "Normal";
     else
       label = "Off";
-    ice_maker_mode->publish_state(label);
+    detail::publish_if(ice_maker_mode, label);
   }
 
   void recompute_appliance_mode_() {
@@ -280,7 +293,7 @@ struct FridgeBus : CommonBus {
       label = "High Usage";
     else
       label = "Normal";
-    appliance_mode->publish_state(label);
+    detail::publish_if(appliance_mode, label);
   }
 
   // Power / smart grid. smart_grid_on was briefly a writable Switch, but
@@ -392,8 +405,8 @@ struct FridgeBus : CommonBus {
   // Enum-to-label mapping (0="Disabled", 1="Enabled") confirmed via live
   // BLE testing 2026-07-25, both directions.
   void publish_night_mode(int v) {
-    if (night_mode_select != nullptr)
-      night_mode_select->publish_state(v == 1 ? "Enabled" : "Disabled");
+    detail::publish_if(night_mode_select,
+                       std::string(v == 1 ? "Enabled" : "Disabled"));
   }
   void publish_night_ice_on(bool v) {
     detail::publish_if(night_ice_on, v);
@@ -424,8 +437,8 @@ struct FridgeBus : CommonBus {
   // 2="Enhanced" (NOT 0/1 like night_mode — do not assume index order for
   // this field).
   void publish_humidity_control(int v) {
-    if (humidity_control_select != nullptr)
-      humidity_control_select->publish_state(v == 2 ? "Enhanced" : "Normal");
+    detail::publish_if(humidity_control_select,
+                       std::string(v == 2 ? "Enhanced" : "Normal"));
   }
   void publish_door_ajar_timeout(int v) {
     detail::publish_if(door_ajar_timeout, static_cast<float>(v));

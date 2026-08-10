@@ -20,6 +20,7 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
 
+#include <cmath>
 #include <functional>
 #include <string>
 #include <utility>
@@ -331,7 +332,10 @@ private:
 // kitchen_timer_duration, etc.). Sub-Zero's protocol uses integers for all
 // the writable numerics we've observed (temps in whole degrees F, timer
 // durations in whole seconds), so control() rounds the float to int before
-// formatting. publish_state echoes back so the UI updates instantly.
+// formatting. Rounds (lroundf), not truncates: a °C-display HA frontend
+// converts back to °F with fractions (3 °C → 37.4 °F), and truncation
+// would write off-by-one setpoints. publish_state echoes back so the UI
+// updates instantly.
 class ApplianceSetNumber : public esphome::number::Number {
 public:
   void set_parent(ApplianceBase *p) { parent_ = p; }
@@ -340,7 +344,8 @@ public:
 protected:
   void control(float value) override {
     if (parent_ != nullptr && !property_key_.empty()) {
-      parent_->enqueue_write_int(property_key_, static_cast<int>(value));
+      parent_->enqueue_write_int(property_key_,
+                                 static_cast<int>(lroundf(value)));
     }
     this->publish_state(value);
   }

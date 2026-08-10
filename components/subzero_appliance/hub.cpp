@@ -82,10 +82,6 @@ void SubzeroHub::handle_connected() {
     return;
   }
 
-  if (d5_handle_ > 0) {
-    HUB_LOGI("gatt", "[%s] D5 already found, skipping", name_.c_str());
-    return;
-  }
   if (post_bond_running_) {
     HUB_LOGI("ble", "[%s] post_bond still running, skipping", name_.c_str());
     return;
@@ -104,15 +100,21 @@ void SubzeroHub::handle_disconnected() {
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
+  write_fail_streak_ = 0;
+  // Consume the flag unconditionally: if it were only cleared on the
+  // handles-cached branch it could latch across a user-initiated reset in
+  // the disconnect window and misclassify the *next* genuine failure as
+  // intentional.
+  const bool intentional = intentional_disconnect_;
+  intentional_disconnect_ = false;
 
   if (d5_handle_ > 0 && phase_ >= 1) {
-    if (intentional_disconnect_) {
-      // Scheduled session refresh — we initiated this. Don't let it
-      // contribute to stale-bond detection; the bond is fine, we're
-      // just rotating the unlock session.
-      intentional_disconnect_ = false;
+    if (intentional) {
+      // We initiated this (session refresh, user Disconnect press, debug
+      // reconnect). Don't let it contribute to stale-bond detection; the
+      // bond is fine.
       HUB_LOGI("ble",
-               "[%s] Disconnected (intentional refresh, handles cached, d5=%d)",
+               "[%s] Disconnected (intentional, handles cached, d5=%d)",
                name_.c_str(), d5_handle_);
     } else {
       fast_retries_ += 1;
@@ -136,6 +138,12 @@ void SubzeroHub::handle_disconnected() {
     phase_ = 0;
     clear_handles_();
     HUB_LOGI("ble", "[%s] Disconnected", name_.c_str());
+    if (intentional) {
+      // An intentional teardown with no cached handles is a reset flow
+      // (press_reset_pairing) — its status message carries instructions;
+      // don't overwrite it with the generic "Disconnected".
+      return;
+    }
   }
   publish_status_("Disconnected");
 }
@@ -147,9 +155,37 @@ std::uint32_t SubzeroHub::handle_passkey_request() {
     HUB_LOGI("ble", "[%s] Replying with PIN: (none)", name_.c_str());
     return 0;
   }
-  HUB_LOGI("ble", "[%s] Replying with PIN: %s", name_.c_str(),
-           stored_pin_.c_str());
+  // Never log the PIN itself — HA/syslog log history is far more widely
+  // readable than the appliance's bonding secret should be. Length is
+  // enough to diagnose a wrong-PIN pairing failure.
+  HUB_LOGI("ble", "[%s] Replying with stored PIN (%u digits)", name_.c_str(),
+           static_cast<unsigned>(stored_pin_.size()));
   return static_cast<std::uint32_t>(std::atoi(stored_pin_.c_str()));
+}
+
+void SubzeroHub::handle_write_failed(std::uint16_t handle) {
+  if (transport_ == nullptr)
+    return;
+  write_fail_streak_ += 1;
+  HUB_LOGW("ble", "[%s] Async GATT write failure at handle %d (streak=%d)",
+           name_.c_str(), handle, write_fail_streak_);
+  if (write_fail_streak_ < kWriteFailStreakThreshold)
+    return;
+  // Persistent ATT-level failures on a live connection mean the cached
+  // handles no longer match the appliance's GATT layout (e.g. it rebooted
+  // into new firmware). The synchronous write() result can't catch this —
+  // esp_ble_gattc_write_char returns ESP_OK and fails asynchronously — so
+  // without this escalation the hub polls a dead handle forever while
+  // every session refresh resets the stale-bond counter.
+  HUB_LOGW("ble",
+           "[%s] %d consecutive write failures - cached handles look stale, "
+           "forcing cold rediscovery",
+           name_.c_str(), write_fail_streak_);
+  publish_status_("Writes failing, rediscovering...");
+  write_fail_streak_ = 0;
+  clear_handles_();
+  phase_ = 0;
+  transport_->disconnect();
 }
 
 // =============================================================================
@@ -173,12 +209,16 @@ void SubzeroHub::handle_d6_notify(const std::uint8_t *data, std::size_t len) {
 void SubzeroHub::process_message_complete_() {
   // Parse straight out of json_buf_'s storage — message_in_place() trims
   // leading ACL garbage in place, avoiding the multi-KB copy-out the old
-  // take_message() path made on every poll response.
-  std::string *msg = json_buf_.message_in_place();
-  if (msg == nullptr)
-    return;
-  handle_complete_message_(*msg);
-  json_buf_.clear();
+  // take_message() path made on every poll response. consume() (rather
+  // than clear()) retains any trailing bytes as the start of the next
+  // message; loop in case the tail already holds a complete one.
+  while (json_buf_.complete()) {
+    std::string *msg = json_buf_.message_in_place();
+    if (msg == nullptr)
+      return;
+    handle_complete_message_(*msg);
+    json_buf_.consume();
+  }
 }
 
 void SubzeroHub::handle_complete_message_(std::string &msg) {
@@ -219,6 +259,7 @@ void SubzeroHub::handle_complete_message_(std::string &msg) {
     return;
   }
   fast_retries_ = 0;
+  write_fail_streak_ = 0;
   // is_poll is set by the parser only when the message was a status:0 poll
   // response (extract_data), which is exactly what the old full-buffer
   // status scan detected — minus the rescan.
@@ -266,7 +307,9 @@ void SubzeroHub::on_pin_confirmed_(const std::string &pin) {
   pin_confirmed_ = true;
   if (pin_input_cb_)
     pin_input_cb_(pin);
-  HUB_LOGI("szg", "[%s] PIN confirmed: %s", name_.c_str(), pin.c_str());
+  // Value deliberately omitted — see handle_passkey_request.
+  HUB_LOGI("szg", "[%s] PIN confirmed (%u digits)", name_.c_str(),
+           static_cast<unsigned>(pin.size()));
   publish_status_("PIN confirmed! Channel unlocked.");
 }
 
@@ -309,7 +352,20 @@ void SubzeroHub::do_periodic_poll() {
     poll_miss_ += 1;
   }
   poll_ok_ = false;
-  json_buf_.clear();
+  // Discard the assembly buffer only when it made no progress since the
+  // previous poll tick. Fragments of a live message arrive within
+  // milliseconds of each other, so an unchanged nonzero byte count across
+  // a full poll interval means that message will never complete. The old
+  // unconditional clear() could orphan the tail of a push that was
+  // mid-assembly right now — leaving an unmatched '{' from its later
+  // fragments wedging brace tracking until the overflow flush, and
+  // manufacturing phantom poll_miss_ increments.
+  if (json_buf_.size() > 0 && json_buf_.size() == last_poll_buf_bytes_) {
+    HUB_LOGW("szg", "[%s] Discarding stale assembly buffer (%d bytes)",
+             name_.c_str(), static_cast<int>(json_buf_.size()));
+    json_buf_.clear();
+  }
+  last_poll_buf_bytes_ = json_buf_.size();
 
   if (!stored_pin_.empty()) {
     write_unlock_channel_(d6_handle_);
@@ -439,24 +495,33 @@ void SubzeroHub::post_bond_giveup_() {
 
 void SubzeroHub::update_handles_from_db_() {
   auto entries = transport_->read_gatt_db();
+  // Track which characteristic the walk is inside so each 0x2902 CCCD
+  // descriptor can be attributed to its owning characteristic — the db is
+  // ordered by handle, descriptors directly follow their characteristic.
+  std::uint8_t current_char = 0;
   for (const auto &e : entries) {
-    if (e.type != GattDbEntry::kCharacteristic)
+    if (e.type == GattDbEntry::kCharacteristic) {
+      current_char = e.uuid_is_128bit ? e.uuid_first_byte : 0;
+      if (!e.uuid_is_128bit)
+        continue;
+      switch (e.uuid_first_byte) {
+      case 0xD5:
+        if (d5_handle_ == 0)
+          d5_handle_ = e.handle;
+        break;
+      case 0xD6:
+        if (d6_handle_ == 0)
+          d6_handle_ = e.handle;
+        break;
+      }
       continue;
-    if (!e.uuid_is_128bit)
-      continue;
-    switch (e.uuid_first_byte) {
-    case 0xD5:
-      if (d5_handle_ == 0)
-        d5_handle_ = e.handle;
-      break;
-    case 0xD6:
-      if (d6_handle_ == 0)
-        d6_handle_ = e.handle;
-      break;
-    case 0xD7:
-      if (d7_handle_ == 0)
-        d7_handle_ = e.handle;
-      break;
+    }
+    if (e.type == GattDbEntry::kDescriptor && e.uuid16 == 0x2902) {
+      if (current_char == 0xD5 && d5_cccd_handle_ == 0) {
+        d5_cccd_handle_ = e.handle;
+      } else if (current_char == 0xD6 && d6_cccd_handle_ == 0) {
+        d6_cccd_handle_ = e.handle;
+      }
     }
   }
 }
@@ -496,14 +561,24 @@ void SubzeroHub::subscribe_register_and_cccd_() {
              d6_handle_);
   }
 
+  // Prefer the 0x2902 descriptor handle actually found in the GATT db;
+  // fall back to the historical `char handle + 2` layout assumption only
+  // when the snapshot didn't include descriptors. The hard-coded offset
+  // would break silently on a firmware GATT re-layout.
   static constexpr std::uint8_t kCccdOn[2] = {0x02, 0x00};
-  transport_->write(static_cast<std::uint16_t>(d5_handle_ + 2), kCccdOn,
-                    sizeof(kCccdOn));
-  HUB_LOGI("ble", "[%s] CCCD write D5 (h=%d)", name_.c_str(), d5_handle_ + 2);
+  const std::uint16_t d5_cccd =
+      d5_cccd_handle_ != 0 ? d5_cccd_handle_
+                           : static_cast<std::uint16_t>(d5_handle_ + 2);
+  transport_->write(d5_cccd, kCccdOn, sizeof(kCccdOn));
+  HUB_LOGI("ble", "[%s] CCCD write D5 (h=%d%s)", name_.c_str(), d5_cccd,
+           d5_cccd_handle_ != 0 ? "" : ", layout fallback");
   if (d6_handle_ > 0) {
-    transport_->write(static_cast<std::uint16_t>(d6_handle_ + 2), kCccdOn,
-                      sizeof(kCccdOn));
-    HUB_LOGI("ble", "[%s] CCCD write D6 (h=%d)", name_.c_str(), d6_handle_ + 2);
+    const std::uint16_t d6_cccd =
+        d6_cccd_handle_ != 0 ? d6_cccd_handle_
+                             : static_cast<std::uint16_t>(d6_handle_ + 2);
+    transport_->write(d6_cccd, kCccdOn, sizeof(kCccdOn));
+    HUB_LOGI("ble", "[%s] CCCD write D6 (h=%d%s)", name_.c_str(), d6_cccd,
+             d6_cccd_handle_ != 0 ? "" : ", layout fallback");
   }
   json_buf_.clear();
 
@@ -520,8 +595,7 @@ void SubzeroHub::subscribe_unlock_() {
     return;
   }
   write_unlock_channel_(d5_handle_);
-  HUB_LOGI("ble", "[%s] Auto-unlock D5 (PIN=%s)", name_.c_str(),
-           stored_pin_.c_str());
+  HUB_LOGI("ble", "[%s] Auto-unlock D5", name_.c_str());
   if (d6_handle_ > 0) {
     write_unlock_channel_(d6_handle_);
     HUB_LOGI("ble", "[%s] Auto-unlock D6", name_.c_str());
@@ -536,8 +610,42 @@ void SubzeroHub::subscribe_initial_get_() {
   subscribe_running_ = false;
   if (!pin_confirmed_)
     return;
-  if (d6_handle_ == 0)
+  if (d6_handle_ == 0) {
+    // The GATT snapshot taken during discovery can be truncated *between*
+    // D5 and D6 — the same BTA-task fill race documented in
+    // esp_idf_transport.h, one handle later. Re-read the db now that the
+    // cache has had time to finish filling.
+    update_handles_from_db_();
+  }
+  if (d6_handle_ == 0) {
+    d6_missing_streak_ += 1;
+    if (d6_missing_streak_ <= kMaxD6RediscoverAttempts) {
+      // Without this the session wedged permanently: no poll, no session
+      // refresh timer, and every fast reconnect reused the truncated
+      // handle cache. Force a cold rediscovery instead.
+      HUB_LOGW("ble",
+               "[%s] D6 missing from GATT snapshot (attempt %d), "
+               "reconnecting for cold rediscovery",
+               name_.c_str(), d6_missing_streak_);
+      publish_status_("Data channel not found, rediscovering...");
+      clear_handles_();
+      phase_ = 0;
+      transport_->disconnect();
+      return;
+    }
+    // Rediscovery keeps coming back without D6 — park instead of looping,
+    // but still arm the session refresh so discovery retries every cycle
+    // rather than never.
+    HUB_LOGW("ble",
+             "[%s] D6 still missing after %d rediscoveries; polling disabled "
+             "until next session refresh",
+             name_.c_str(), d6_missing_streak_);
+    publish_status_("Data channel missing - will retry discovery later");
+    scheduler_->set_timeout(kTimeoutSessionRefresh, kSessionRefreshIntervalMs,
+                            [this]() { disconnect_for_session_refresh_(); });
     return;
+  }
+  d6_missing_streak_ = 0;
   poll_ok_ = false;
   write_poll_command_(d6_handle_);
   publish_status_("Connected and polling.");
@@ -603,6 +711,8 @@ void SubzeroHub::press_connect() {
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
+  write_fail_streak_ = 0;
+  d6_missing_streak_ = 0;
 }
 
 void SubzeroHub::press_start_pairing() {
@@ -633,8 +743,7 @@ void SubzeroHub::press_submit_pin() {
     return;
   }
   write_unlock_channel_(d5_handle_);
-  HUB_LOGI("ble", "[%s] unlock_channel (PIN=%s)", name_.c_str(),
-           stored_pin_.c_str());
+  HUB_LOGI("ble", "[%s] unlock_channel sent", name_.c_str());
   publish_status_("Unlock sent...");
   scheduler_->set_timeout(kTimeoutSubmitPinPoll, kSubmitPinPollDelayMs,
                           [this]() {
@@ -673,6 +782,8 @@ void SubzeroHub::press_log_debug_info() {
   HUB_LOGI("ble", "[%s] Log Debug Info: forcing reconnect for fresh unlock",
            name_.c_str());
   publish_status_("Debug mode ON - reconnecting for fresh poll...");
+  // Deliberate disconnect — must not count toward stale-bond detection.
+  intentional_disconnect_ = true;
   transport_->disconnect();
 }
 
@@ -690,12 +801,18 @@ void SubzeroHub::press_reset_pairing() {
   post_bond_running_ = false;
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
+  write_fail_streak_ = 0;
+  d6_missing_streak_ = 0;
   transport_->cache_clean();
   transport_->remove_bond();
   HUB_LOGW("ble", "[%s] Bond removed, GATT cache cleared, all state reset",
            name_.c_str());
   publish_status_(
       "Pairing fully reset. Power-cycle appliance, then press Connect.");
+  // The caller disconnects right after this; tag it so handle_disconnected
+  // preserves the instruction above instead of clobbering it with the
+  // generic "Disconnected" status.
+  intentional_disconnect_ = true;
 }
 
 // =============================================================================
@@ -706,7 +823,9 @@ void SubzeroHub::set_stored_pin(const std::string &pin) {
   stored_pin_ = pin;
   unlock_cmd_.clear(); // rebuilt lazily by write_unlock_channel_
   if (!pin.empty()) {
-    HUB_LOGI("szg", "[%s] PIN updated: %s", name_.c_str(), pin.c_str());
+    // Value deliberately omitted — see handle_passkey_request.
+    HUB_LOGI("szg", "[%s] PIN updated (%u digits)", name_.c_str(),
+             static_cast<unsigned>(pin.size()));
   }
 }
 
@@ -736,7 +855,8 @@ void SubzeroHub::cancel_all_timeouts_() {
 void SubzeroHub::clear_handles_() {
   d5_handle_ = 0;
   d6_handle_ = 0;
-  d7_handle_ = 0;
+  d5_cccd_handle_ = 0;
+  d6_cccd_handle_ = 0;
 }
 
 void SubzeroHub::write_unlock_channel_(std::uint16_t handle) {
@@ -774,15 +894,21 @@ void SubzeroHub::write_set_property_(const std::string &key,
   // visible UX win (HA will retry on the next user action). Still log
   // it: a silently-dropped write previously looked identical to "nothing
   // happened" with no way to tell the two apart from the logs.
-  if (d5_handle_ == 0 || !pin_confirmed_) {
+  // The connected() check matters: after a disconnect with handles
+  // cached, d5_handle_ stays non-zero and pin_confirmed_ true, so a
+  // drained queued write would pass the other two guards, "succeed"
+  // locally, fail at the stack, and vanish silently — while the entity
+  // already published the optimistic state.
+  if (d5_handle_ == 0 || !pin_confirmed_ || !transport_->connected()) {
     // Deliberately omit json_value here — this path also carries
     // remote_svc_reg_token (the "Clear Cloud Token" button), so logging
     // the attempted value verbatim risks putting a cloud token in the
     // logs. The key plus readiness flags are enough to diagnose a drop.
     HUB_LOGW("szg",
              "[%s] Dropping write to %s: control channel not ready "
-             "(d5_handle=%d, pin_confirmed=%d)",
-             name_.c_str(), key.c_str(), d5_handle_, pin_confirmed_);
+             "(d5_handle=%d, pin_confirmed=%d, connected=%d)",
+             name_.c_str(), key.c_str(), d5_handle_, pin_confirmed_,
+             transport_->connected());
     return;
   }
   std::string cmd = esphome::subzero_protocol::build_set(key, json_value);

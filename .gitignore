@@ -1,19 +1,22 @@
-# ignore all files and all directories
+# Allowlist-style ignore: everything is ignored unless negated below.
+# CAUTION: a new top-level file/dir (or a new file type in a partially
+# negated dir) is INVISIBLE to `git status` until it gets a negation here.
+# Prefer directory-wide globs over per-file entries so additions in
+# already-tracked areas show up automatically.
 *
 */
 
 !.gitignore
-!.github/workflows/ci.yml
-!.github/workflows/release.yml
+!.github/
 !.github/workflows/
+!.github/workflows/*.yml
 !.github/ISSUE_TEMPLATE/
 !.github/ISSUE_TEMPLATE/**
-!.github/
+!.github/FUNDING.yml
 !README.adoc
 !docs/
-!docs/advanced.adoc
-!docs/ble-protocol.adoc
-!subzero.yaml
+!docs/*.adoc
+!secrets-example.yaml
 !cove-minimal-dishwasher.yaml
 !wolf-minimal-range.yaml
 !wolf-minimal-fridge.yaml
@@ -26,7 +29,6 @@
 !components/subzero_appliance/
 !components/subzero_appliance/**
 !tests/
-!tests/README.md
 !tests/fixtures/
 !tests/fixtures/**
 !tests/cpp/
@@ -39,4 +41,3 @@
 __pycache__/
 *.pyc
 .DS_Store
-subzero.yaml

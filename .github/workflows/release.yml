@@ -72,20 +72,22 @@ jobs:
           kitchen_range_pin: "000002"
           main_fridge_mac: "00:06:80:00:00:03"
           main_fridge_pin: "000003"
+          ota_password: "ci-dummy-ota-password"
+          encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
           EOF
 
       - name: Validate configs before tagging
         run: |
           REF="${GITHUB_SHA}"
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" \
-            cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml
-          for yaml in cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml; do
+            cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
+          for yaml in cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml; do
             echo "::group::Validating $yaml"
             esphome config "$yaml"
             echo "::endgroup::"
           done
           # Restore the originals so the later sed/commit step operates on clean files.
-          git checkout -- cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml
+          git checkout -- cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
 
       - name: Create tag on current HEAD
         run: |
@@ -108,6 +110,7 @@ jobs:
             wolf-minimal-fridge.yaml \
             wolf-minimal-range.yaml \
             cove-minimal-dishwasher.yaml \
+            ci-fridge-write-support.yaml \
             README.adoc
 
       - name: Create version bump PR

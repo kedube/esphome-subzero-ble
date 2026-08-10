@@ -159,16 +159,61 @@ TEST(MessageBuffer, NestedBracesDoNotFalseComplete) {
 
 TEST(MessageBuffer, StickyCompleteThroughTrailingBytes) {
   // Once complete, subsequent feeds accumulate bytes (next message) but
-  // complete_ stays true until take_message()/clear(). The notify lambda
-  // calls take_message() promptly so trailing bytes for the next response
-  // don't accumulate in practice — but verify the sticky property.
+  // complete_ stays true until consume()/clear(). take_message() returns
+  // only the completed message; the trailing bytes survive as the start
+  // of the next message.
   MessageBuffer b;
   EXPECT_TRUE(feed_str(b, "{\"a\":1}"));
   EXPECT_TRUE(feed_str(b, "extra")); // doesn't affect completion
   EXPECT_TRUE(b.complete());
   auto msg = b.take_message();
   ASSERT_TRUE(msg.has_value());
-  EXPECT_EQ(*msg, "{\"a\":1}extra");
+  EXPECT_EQ(*msg, "{\"a\":1}");
+  EXPECT_EQ(b.size(), 5u); // "extra" retained
+}
+
+TEST(MessageBuffer, TrailingNextMessagePrefixSurvivesConsume) {
+  // Regression: the D6 stream has no message-aligned fragment boundaries,
+  // so one indication can carry message A's closing '}' plus the start of
+  // message B. The old clear-everything path discarded B's opening '{';
+  // B's later fragments then had unbalanced braces and every subsequent
+  // message was silently swallowed until the kMaxBytes flush.
+  MessageBuffer b;
+  EXPECT_TRUE(feed_str(b, "{\"a\":1}{\"seq\":2,"));
+  auto msg = b.take_message();
+  ASSERT_TRUE(msg.has_value());
+  EXPECT_EQ(*msg, "{\"a\":1}");
+  // B's prefix is retained and completes normally.
+  EXPECT_FALSE(b.complete());
+  EXPECT_TRUE(feed_str(b, "\"x\":3}"));
+  auto msg2 = b.take_message();
+  ASSERT_TRUE(msg2.has_value());
+  EXPECT_EQ(*msg2, "{\"seq\":2,\"x\":3}");
+}
+
+TEST(MessageBuffer, TwoCompleteMessagesInOneFeed) {
+  // If a feed lands two complete messages, consume() re-detects the
+  // second — complete() is true again immediately, so callers can loop.
+  MessageBuffer b;
+  EXPECT_TRUE(feed_str(b, "{\"a\":1}{\"b\":2}"));
+  auto first = b.take_message();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(*first, "{\"a\":1}");
+  EXPECT_TRUE(b.complete());
+  auto second = b.take_message();
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(*second, "{\"b\":2}");
+  EXPECT_EQ(b.size(), 0u);
+  EXPECT_FALSE(b.complete());
+}
+
+TEST(MessageBuffer, ConsumeWithoutCompleteClears) {
+  // Defensive: consume() on an incomplete buffer degrades to clear().
+  MessageBuffer b;
+  feed_str(b, "{\"a");
+  b.consume();
+  EXPECT_EQ(b.size(), 0u);
+  EXPECT_FALSE(b.complete());
 }
 
 TEST(MessageBuffer, RealWorldFridgePollResponse) {

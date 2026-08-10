@@ -72,8 +72,24 @@ void ApplianceBase::gattc_event_handler(esp_gattc_cb_event_t event,
     }
     h->handle_connected();
     break;
-  case ESP_GATTC_DISCONNECT_EVT:
+  case ESP_GATTC_DISCONNECT_EVT: {
+    const std::size_t dropped = write_queue_.clear();
+    if (dropped > 0) {
+      ESP_LOGW(TAG, "[%s] Discarding %u queued writes on disconnect",
+               name_str_.c_str(), static_cast<unsigned>(dropped));
+    }
     h->handle_disconnected();
+    break;
+  }
+  case ESP_GATTC_WRITE_CHAR_EVT:
+    if (param->write.status != ESP_GATT_OK) {
+      h->handle_write_failed(param->write.handle);
+    }
+    break;
+  case ESP_GATTC_WRITE_DESCR_EVT:
+    if (param->write.status != ESP_GATT_OK) {
+      h->handle_write_failed(param->write.handle);
+    }
     break;
   case ESP_GATTC_NOTIFY_EVT: {
     std::uint16_t nh = param->notify.handle;
@@ -112,7 +128,13 @@ void ApplianceBase::press_connect() {
   transport_.connect();
 }
 
-void ApplianceBase::press_disconnect() { transport_.disconnect(); }
+void ApplianceBase::press_disconnect() {
+  // User-initiated: must not count toward stale-bond detection, or three
+  // Disconnect presses without an intervening successful parse would
+  // wrongly wipe a healthy bond.
+  hub()->notify_intentional_disconnect();
+  transport_.disconnect();
+}
 
 void ApplianceBase::enqueue_write_(const std::string &key,
                                    std::function<void()> write_fn) {

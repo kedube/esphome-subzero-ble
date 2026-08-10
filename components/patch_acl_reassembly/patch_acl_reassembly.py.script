@@ -5,26 +5,88 @@ stock ESP-IDF version to fix Bluedroid ACL continuation fragment reassembly.
 See: https://github.com/espressif/esp-idf/issues/18414
 
 This will be removed once the upstream fix is merged into ESP-IDF.
+
+Safety properties (each one covers a real failure mode):
+  * Fails the BUILD (not a log line) when anything is off — proceeding
+    unpatched silently reintroduces the ACL reassembly bug this component
+    exists to fix.
+  * Idempotent: skips when the target already matches the patch.
+  * Identity-checked: refuses to overwrite a target that doesn't look like
+    the Bluedroid packet fragmenter (an ESP-IDF refactor moved or rewrote
+    the file — the patch needs re-verification, not blind application).
+  * Keeps a one-time `packet_fragmenter.c.orig` backup beside the target.
+    The framework package is SHARED between every PlatformIO project on
+    this machine; the backup makes the mutation discoverable and
+    reversible after this component is removed.
+  * Atomic: writes a temp file and os.replace()s it, so an interrupted
+    build can't leave a truncated source file breaking all IDF builds.
 """
 
 Import("env")
 
 import os
-import shutil
+import tempfile
 
 PROJECT_DIR = env.subst("$PROJECT_DIR")
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-espidf")
+
+# Strings that must appear in any packet_fragmenter.c this patch is
+# compatible with — they confirm the target is the same HCI-layer module
+# the replacement file implements against.
+IDENTITY_MARKERS = (b"reassemble_and_dispatch", b"packet_fragmenter_get_interface")
+
+
+def fail(msg):
+    raise SystemExit(
+        "  [ACL patch] BUILD STOPPED: %s\n"
+        "  [ACL patch] The patch_acl_reassembly component could not verify "
+        "the ESP-IDF Bluedroid target. Building without the patch would "
+        "silently reintroduce the ACL reassembly bug "
+        "(https://github.com/espressif/esp-idf/issues/18414). Remove the "
+        "component from your YAML to build unpatched deliberately." % msg
+    )
+
+
+if FRAMEWORK_DIR is None:
+    fail("framework-espidf package not found (esp-idf framework required)")
 
 SRC = os.path.join(PROJECT_DIR, "packet_fragmenter.c.patch")
 DST = os.path.join(
     FRAMEWORK_DIR,
     "components", "bt", "host", "bluedroid", "hci", "packet_fragmenter.c",
 )
+BACKUP = DST + ".orig"
 
 if not os.path.isfile(SRC):
-    print("  [ACL patch] Source file not found: %s" % SRC)
-elif not os.path.isfile(DST):
-    print("  [ACL patch] Target not found (ESP-IDF layout changed?): %s" % DST)
+    fail("patch source not found: %s" % SRC)
+if not os.path.isfile(DST):
+    fail("target not found (ESP-IDF layout changed?): %s" % DST)
+
+with open(SRC, "rb") as f:
+    patched = f.read()
+with open(DST, "rb") as f:
+    current = f.read()
+
+if current == patched:
+    print("  [ACL patch] packet_fragmenter.c already patched, skipping")
 else:
-    shutil.copy2(SRC, DST)
-    print("  [ACL patch] Patched packet_fragmenter.c")
+    for marker in IDENTITY_MARKERS:
+        if marker not in current:
+            fail(
+                "target does not look like the Bluedroid packet fragmenter "
+                "(missing %r) — ESP-IDF changed; the patch needs "
+                "re-verification against this version" % marker.decode()
+            )
+    if not os.path.exists(BACKUP):
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DST))
+        with os.fdopen(fd, "wb") as f:
+            f.write(current)
+        os.replace(tmp, BACKUP)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DST))
+    with os.fdopen(fd, "wb") as f:
+        f.write(patched)
+    os.replace(tmp, DST)
+    print(
+        "  [ACL patch] Patched packet_fragmenter.c in the SHARED "
+        "framework-espidf package (%s); original kept at %s" % (DST, BACKUP)
+    )

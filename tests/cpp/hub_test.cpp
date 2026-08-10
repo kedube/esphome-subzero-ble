@@ -18,6 +18,7 @@ using esphome::subzero_appliance::BleResult;
 using esphome::subzero_appliance::FakeScheduler;
 using esphome::subzero_appliance::GattDbEntry;
 using esphome::subzero_appliance::make_char_entry;
+using esphome::subzero_appliance::make_desc_entry;
 using esphome::subzero_appliance::MockBleTransport;
 using esphome::subzero_appliance::SubzeroHub;
 
@@ -33,6 +34,7 @@ public:
   bool parse_and_dispatch_(std::string &msg) override {
     last_message_ = msg;
     parse_called_ = true;
+    parse_count_ += 1;
     // Mirror the real subclasses' contract: run the real parser (the
     // copying variant — tests inspect last_message_ and the raw payload)
     // and report protocol metadata via note_response_meta_() on every
@@ -52,6 +54,7 @@ public:
   }
 
   bool parse_called_ = false;
+  int parse_count_ = 0;
   std::string last_message_;
   bool parse_should_succeed_ = true;
   bool parse_should_confirm_pin_ = false;
@@ -926,4 +929,268 @@ TEST_F(HubFixture, SessionRefresh_DoesNotIncrementFastRetries) {
   hub_.handle_disconnected();
   EXPECT_EQ(hub_.fast_retries(), 1)
       << "Unexpected disconnects after a refresh must still count.";
+}
+
+// =============================================================================
+// D6-missing recovery (truncated GATT snapshot between D5 and D6)
+// =============================================================================
+
+namespace {
+std::vector<GattDbEntry> d5_only_gatt_db() {
+  return {make_char_entry(0xD5, 0x10)};
+}
+} // namespace
+
+TEST_F(HubFixture, D6Missing_ForcesColdRediscoveryInsteadOfWedging) {
+  // Regression: a GATT snapshot truncated between D5 and D6 used to wedge
+  // the session permanently — no poll, no session-refresh timer, and
+  // every fast reconnect reused the truncated handle cache.
+  hub_.set_stored_pin("12345");
+  transport_.set_gatt_db(d5_only_gatt_db());
+  hub_.handle_connected();
+  std::size_t disc_before = transport_.disconnect_count();
+  scheduler_.advance_by(3000); // through subscribe_initial_get_
+
+  EXPECT_GT(transport_.disconnect_count(), disc_before)
+      << "Missing D6 must force a reconnect for cold rediscovery.";
+  EXPECT_EQ(hub_.d5_handle(), 0) << "Handles must be cleared so the next "
+                                    "connect runs full discovery.";
+  EXPECT_EQ(hub_.phase(), 0);
+  EXPECT_TRUE(any_status_contains("rediscovering"));
+}
+
+TEST_F(HubFixture, D6Missing_RereadsDbBeforeGivingUp) {
+  // The cache may simply have finished filling since discovery — if a
+  // re-read at subscribe_initial_get_ time finds D6, the session
+  // proceeds normally with no reconnect.
+  hub_.set_stored_pin("12345");
+  transport_.set_gatt_db(d5_only_gatt_db());
+  hub_.handle_connected();
+  scheduler_.advance_by(2000); // just past subscribe_unlock_ (D5 known)
+  // The cache finishes filling before subscribe_initial_get_ fires.
+  transport_.set_gatt_db(full_gatt_db());
+  std::size_t disc_before = transport_.disconnect_count();
+  scheduler_.advance_by(1000); // subscribe_initial_get_
+
+  EXPECT_EQ(transport_.disconnect_count(), disc_before);
+  EXPECT_EQ(hub_.d6_handle(), 0x12);
+  EXPECT_TRUE(any_status_contains("Connected and polling"));
+  EXPECT_TRUE(scheduler_.has_pending("session_refresh"));
+}
+
+TEST_F(HubFixture, D6Missing_ParksWithRefreshTimerAfterMaxAttempts) {
+  // If rediscovery keeps coming back without D6, the hub parks instead of
+  // reconnect-looping — but the session-refresh timer stays armed so
+  // discovery retries periodically rather than never.
+  hub_.set_stored_pin("12345");
+  transport_.set_gatt_db(d5_only_gatt_db());
+
+  for (int attempt = 0; attempt < 3; attempt++) {
+    hub_.handle_connected();
+    scheduler_.advance_by(20000); // generous: through every ladder stage
+    hub_.handle_disconnected();
+  }
+  // Attempts 1 and 2 reconnect; attempt 3 exceeds the cap and parks.
+  hub_.handle_connected();
+  scheduler_.advance_by(20000);
+  EXPECT_TRUE(any_status_contains("Data channel missing"));
+  EXPECT_TRUE(scheduler_.has_pending("session_refresh"))
+      << "Parked state must keep the periodic retry armed.";
+}
+
+// =============================================================================
+// Async GATT write failures (stale cached handles)
+// =============================================================================
+
+TEST_F(HubFixture, WriteFailStreak_ForcesColdRediscovery) {
+  // Regression: esp_ble_gattc_write_char returns ESP_OK synchronously for
+  // a stale handle; the failure arrives via WRITE_CHAR_EVT. Without
+  // escalation the hub polls a dead handle forever and every session
+  // refresh resets the stale-bond counter.
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  std::size_t disc_before = transport_.disconnect_count();
+
+  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12);
+  EXPECT_EQ(transport_.disconnect_count(), disc_before)
+      << "Below the threshold, transient write failures must not reconnect.";
+  hub_.handle_write_failed(0x12);
+
+  EXPECT_GT(transport_.disconnect_count(), disc_before);
+  EXPECT_EQ(hub_.d5_handle(), 0)
+      << "Handles must be cleared for cold rediscovery.";
+  EXPECT_EQ(hub_.phase(), 0);
+  EXPECT_TRUE(any_status_contains("Writes failing"));
+}
+
+TEST_F(HubFixture, WriteFailStreak_ResetBySuccessfulParse) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  std::size_t disc_before = transport_.disconnect_count();
+
+  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12);
+  // A successfully parsed message proves the link + handles work.
+  std::string msg = "{\"status\":0,\"resp\":{\"foo\":1}}\n";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(msg.data()),
+                        msg.size());
+  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12);
+
+  EXPECT_EQ(transport_.disconnect_count(), disc_before)
+      << "The streak must reset on a successful parse — only consecutive "
+         "failures indicate stale handles.";
+}
+
+// =============================================================================
+// Intentional disconnects and stale-bond accounting
+// =============================================================================
+
+TEST_F(HubFixture, UserDisconnect_DoesNotCountTowardStaleBond) {
+  // Regression: three user Disconnect presses without an intervening
+  // successful parse used to hit kStaleBondsThreshold and wipe a healthy
+  // bond.
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  for (int i = 0; i < 3; i++) {
+    hub_.notify_intentional_disconnect(); // what press_disconnect() does
+    hub_.handle_disconnected();
+  }
+  EXPECT_EQ(hub_.fast_retries(), 0);
+  EXPECT_EQ(transport_.remove_bond_count(), 0u);
+  EXPECT_NE(hub_.d5_handle(), 0) << "Handles stay cached for fast reconnect.";
+}
+
+TEST_F(HubFixture, IntentionalFlag_ConsumedEvenOnHandleslessDisconnect) {
+  // Regression: the flag was only cleared on the handles-cached branch,
+  // so it could latch across a reset flow and misclassify the NEXT
+  // genuine failure as intentional.
+  hub_.set_stored_pin("12345");
+  hub_.notify_intentional_disconnect();
+  hub_.handle_disconnected(); // no handles: else-branch
+
+  // Now a real (unintentional) failure with cached handles must count.
+  run_to_ready_();
+  hub_.handle_disconnected();
+  EXPECT_EQ(hub_.fast_retries(), 1)
+      << "A stale intentional flag must not absorb a genuine failure.";
+}
+
+TEST_F(HubFixture, ResetPairing_StatusInstructionSurvivesDisconnect) {
+  // Regression: the "Pairing fully reset..." instruction was immediately
+  // clobbered by the generic "Disconnected" status from the disconnect
+  // that follows.
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.press_reset_pairing();
+  hub_.handle_disconnected(); // the caller's transport disconnect lands
+  EXPECT_TRUE(last_status_contains("Pairing fully reset"))
+      << "Last status: " << (status_log_.empty() ? "" : status_log_.back());
+}
+
+// =============================================================================
+// CCCD descriptor lookup
+// =============================================================================
+
+TEST_F(HubFixture, Cccd_UsesDiscoveredDescriptorHandles) {
+  // When the GATT db includes the 0x2902 descriptors, their real handles
+  // are used instead of the `char handle + 2` layout assumption.
+  hub_.set_stored_pin("12345");
+  transport_.set_gatt_db({
+      make_char_entry(0xD5, 0x10),
+      make_desc_entry(0x2902, 0x14), // D5's CCCD, NOT at 0x12
+      make_char_entry(0xD6, 0x20),
+      make_desc_entry(0x2902, 0x23), // D6's CCCD, NOT at 0x22
+  });
+  hub_.handle_connected();
+  scheduler_.advance_by(3000);
+
+  EXPECT_EQ(hub_.d5_cccd_handle(), 0x14);
+  EXPECT_EQ(hub_.d6_cccd_handle(), 0x23);
+  bool wrote_d5_cccd = false, wrote_d6_cccd = false;
+  for (std::size_t i = 0; i < transport_.write_count(); i++) {
+    const auto &w = transport_.write_at(i);
+    if (w.bytes == std::vector<std::uint8_t>{0x02, 0x00}) {
+      if (w.handle == 0x14)
+        wrote_d5_cccd = true;
+      if (w.handle == 0x23)
+        wrote_d6_cccd = true;
+    }
+  }
+  EXPECT_TRUE(wrote_d5_cccd);
+  EXPECT_TRUE(wrote_d6_cccd);
+}
+
+TEST_F(HubFixture, Cccd_FallsBackToLayoutAssumptionWithoutDescriptors) {
+  // Snapshot without descriptor entries: the historical +2 offset applies.
+  hub_.set_stored_pin("12345");
+  run_to_ready_(); // full_gatt_db() has no descriptors
+  bool wrote_d5_fallback = false;
+  for (std::size_t i = 0; i < transport_.write_count(); i++) {
+    const auto &w = transport_.write_at(i);
+    if (w.handle == 0x12 && w.bytes == std::vector<std::uint8_t>{0x02, 0x00})
+      wrote_d5_fallback = true;
+  }
+  EXPECT_TRUE(wrote_d5_fallback);
+}
+
+// =============================================================================
+// Message framing at the hub level
+// =============================================================================
+
+TEST_F(HubFixture, D6Notify_BackToBackMessagesBothDispatch) {
+  // One indication carrying the end of message A and all of message B —
+  // both must parse; B's prefix must not be discarded with A.
+  std::string both = "{\"status\":0,\"resp\":{\"a\":1}}{\"props\":{\"b\":2}}";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(both.data()),
+                        both.size());
+  EXPECT_EQ(hub_.parse_count_, 2);
+}
+
+TEST_F(HubFixture, D6Notify_SplitAcrossMessagesKeepsNextPrefix) {
+  // A completes mid-fragment; B's opening bytes ride in the same
+  // indication and B completes later.
+  std::string frag1 = "{\"status\":0,\"resp\":{\"a\":1}}{\"props\":";
+  std::string frag2 = "{\"b\":2}}";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(frag1.data()),
+                        frag1.size());
+  EXPECT_EQ(hub_.parse_count_, 1);
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(frag2.data()),
+                        frag2.size());
+  EXPECT_EQ(hub_.parse_count_, 2);
+}
+
+TEST_F(HubFixture, PeriodicPoll_DoesNotClobberActivelyAssemblingPush) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  // A push starts assembling right before the poll tick...
+  std::string part1 = "{\"props\":{\"door_ajar\":";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(part1.data()),
+                        part1.size());
+  hub_.do_periodic_poll();
+  // ...and its remaining fragments arrive after. The message must still
+  // complete — the old unconditional clear() orphaned the tail.
+  std::string part2 = "true}}";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(part2.data()),
+                        part2.size());
+  EXPECT_EQ(hub_.parse_count_, 1);
+}
+
+TEST_F(HubFixture, PeriodicPoll_ClearsBufferOnlyWhenStale) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  std::string part1 = "{\"props\":{\"door_ajar\":";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(part1.data()),
+                        part1.size());
+  // Two poll ticks with zero progress: the fragment's message will never
+  // complete — buffer must be flushed so it can't wedge the next message.
+  hub_.do_periodic_poll();
+  hub_.do_periodic_poll();
+  // A fresh complete message parses normally.
+  std::string fresh = "{\"status\":0,\"resp\":{\"a\":1}}";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(fresh.data()),
+                        fresh.size());
+  EXPECT_EQ(hub_.parse_count_, 1);
 }

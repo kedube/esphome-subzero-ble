@@ -84,6 +84,17 @@ public:
 
   std::size_t pending() const { return queue_.size(); }
 
+  // Discard all pending writes and return how many were dropped. Called
+  // on disconnect: queued writes can be up to kMaxPending * kSpacingMs
+  // old, and letting them fire into the *next* session before its channel
+  // unlock completes both fails the writes and risks interleaving with
+  // the subscribe ladder.
+  std::size_t clear() {
+    const std::size_t dropped = queue_.size();
+    queue_.clear();
+    return dropped;
+  }
+
 private:
   struct PendingWrite {
     std::string key;

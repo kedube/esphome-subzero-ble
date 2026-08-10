@@ -12,6 +12,12 @@ on:
   schedule:
     - cron: "0 6 * * 1"
 
+# No job needs anything beyond reading the repo; without this the workflow
+# inherits the repository-default GITHUB_TOKEN permissions, which can be
+# read/write depending on repo settings.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -36,7 +42,9 @@ jobs:
         run: cmake --build tests/cpp/build -j
 
       - name: Run tests
-        run: ctest --test-dir tests/cpp/build --output-on-failure
+        # --no-tests=error: a CMake refactor that silently breaks test
+        # discovery must fail the job, not pass green with zero tests run.
+        run: ctest --test-dir tests/cpp/build --output-on-failure --no-tests=error
 
   validate:
     name: Validate ESPHome configs
@@ -62,6 +70,8 @@ jobs:
           kitchen_range_pin: "000002"
           main_fridge_mac: "00:06:80:00:00:03"
           main_fridge_pin: "000003"
+          ota_password: "ci-dummy-ota-password"
+          encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
           EOF
 
       - name: Patch package refs for CI
@@ -76,6 +86,11 @@ jobs:
           # sed eats as the delimiter. # is safe in both pattern and replacement.
           REF="${GITHUB_HEAD_REF:-$GITHUB_SHA}"
           REPO="${HEAD_REPO:-$GITHUB_REPOSITORY}"
+          # Escape sed-replacement metacharacters (&, \, and the # delimiter):
+          # fork-PR branch names are attacker-chosen and would otherwise break
+          # or inject into the YAML being validated.
+          REF=$(printf '%s' "$REF" | sed -e 's/[\&#]/\\&/g')
+          REPO=$(printf '%s' "$REPO" | sed -e 's/[\&#]/\\&/g')
           sed -i -E "s#url: https://github.com/[^[:space:]]+#url: https://github.com/${REPO}#" \
             cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" \
@@ -122,6 +137,8 @@ jobs:
           kitchen_range_pin: "000002"
           main_fridge_mac: "00:06:80:00:00:03"
           main_fridge_pin: "000003"
+          ota_password: "ci-dummy-ota-password"
+          encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
           EOF
 
       - name: Patch package refs for CI
@@ -133,6 +150,11 @@ jobs:
           # sed eats as the delimiter. # is safe in both pattern and replacement.
           REF="${GITHUB_HEAD_REF:-$GITHUB_SHA}"
           REPO="${HEAD_REPO:-$GITHUB_REPOSITORY}"
+          # Escape sed-replacement metacharacters (&, \, and the # delimiter):
+          # fork-PR branch names are attacker-chosen and would otherwise break
+          # or inject into the YAML being validated.
+          REF=$(printf '%s' "$REF" | sed -e 's/[\&#]/\\&/g')
+          REPO=$(printf '%s' "$REPO" | sed -e 's/[\&#]/\\&/g')
           sed -i -E "s#url: https://github.com/[^[:space:]]+#url: https://github.com/${REPO}#" "${{ matrix.file }}"
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" "${{ matrix.file }}"
 

@@ -1,5 +1,7 @@
 #include "protocol.h"
 
+#include "log_sanitize.h"
+
 #include <ArduinoJson.h>
 #include <cstdio>
 #include <cstring>
@@ -19,7 +21,15 @@ std::optional<std::string> opt_str(JsonVariantConst v) {
   if (!v.is<const char *>())
     return std::nullopt;
   const char *s = v.as<const char *>();
-  return s ? std::optional<std::string>(s) : std::nullopt;
+  if (s == nullptr)
+    return std::nullopt;
+  // Every device-supplied string is sanitized with the same ASCII
+  // allowlist used for raw-buffer logging. ArduinoJson does not validate
+  // UTF-8 inside string values, so an ACL-corrupted high-bit byte
+  // survives parsing — and these values flow to HA text sensors over the
+  // same protobuf transport that log_sanitize.h documents as crashing on
+  // non-UTF-8 bytes.
+  return sanitize_for_log(s, 0, std::string::npos);
 }
 
 std::optional<bool> opt_bool(JsonVariantConst v) {
@@ -42,7 +52,9 @@ std::optional<float> opt_float(JsonVariantConst v) {
 
 void collect_keys(JsonObjectConst data, std::vector<std::string> &out) {
   for (JsonPairConst kv : data) {
-    out.emplace_back(kv.key().c_str());
+    // Keys are logged in debug mode — same untrusted-byte concern as
+    // opt_str values.
+    out.emplace_back(sanitize_for_log(kv.key().c_str(), 0, std::string::npos));
   }
 }
 
@@ -193,10 +205,27 @@ void fill_version(JsonObjectConst v, Version &out) {
   out.appliance = opt_str(v["appliance"]);
 }
 
+// Real appliance PINs are numeric passkeys. Accepting anything else here
+// is dangerous: the hub overwrites its stored PIN with this value, so a
+// corrupted-but-parseable message carrying `"pin":""` (or garbage bytes)
+// would wipe a valid PIN and block all writes until the user re-pairs.
+bool valid_pin(const char *pin) {
+  if (pin == nullptr)
+    return false;
+  std::size_t n = std::strlen(pin);
+  if (n == 0 || n > 10)
+    return false;
+  for (std::size_t i = 0; i < n; i++) {
+    if (pin[i] < '0' || pin[i] > '9')
+      return false;
+  }
+  return true;
+}
+
 void fill_common(JsonObjectConst data, CommonFields &out) {
   if (data["pin"].is<const char *>()) {
     const char *pin = data["pin"].as<const char *>();
-    if (pin && std::strlen(pin) <= 10) {
+    if (valid_pin(pin)) {
       out.pin_confirmed = std::string(pin);
     }
   }
@@ -221,21 +250,27 @@ void fill_common(JsonObjectConst data, CommonFields &out) {
 // Minutes between two ISO-8601 timestamps ("YYYY-MM-DDTHH:MM[:SS...]").
 // Returns nullopt if either string can't be parsed. Uses day-of-month math,
 // which matches the legacy lambda behavior (adequate for wash cycles under
-// a month). Same-month assumption.
+// a month). The same-month assumption is enforced: a cycle spanning
+// midnight on the last day of a month reports "unknown" instead of the
+// false 0 the unchecked day arithmetic used to produce. Field widths are
+// bounded so a hostile digit string can't overflow sscanf's %d (undefined
+// behavior per C11 7.21.6.2); an over-long field fails the count check.
 std::optional<int> minutes_between(const char *now_iso,
                                    const std::string &end_iso) {
   if (end_iso.size() < 16)
     return std::nullopt;
   int ey, emo, ed, eh, emi;
-  if (std::sscanf(end_iso.c_str(), "%d-%d-%dT%d:%d", &ey, &emo, &ed, &eh,
+  if (std::sscanf(end_iso.c_str(), "%4d-%2d-%2dT%2d:%2d", &ey, &emo, &ed, &eh,
                   &emi) != 5) {
     return std::nullopt;
   }
-  int cy, cmo, cd, ch, cmi, cs = 0;
-  if (std::sscanf(now_iso, "%d-%d-%dT%d:%d:%d", &cy, &cmo, &cd, &ch, &cmi,
-                  &cs) < 5) {
+  int cy, cmo, cd, ch, cmi;
+  if (std::sscanf(now_iso, "%4d-%2d-%2dT%2d:%2d", &cy, &cmo, &cd, &ch, &cmi) !=
+      5) {
     return std::nullopt;
   }
+  if (ey != cy || emo != cmo)
+    return std::nullopt;
   int end_mins = (ed * 24 * 60) + (eh * 60) + emi;
   int cur_mins = (cd * 24 * 60) + (ch * 60) + cmi;
   int remaining = end_mins - cur_mins;

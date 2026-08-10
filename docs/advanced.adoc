@@ -204,8 +204,7 @@ The per-appliance hubs check `s.valid`, `s.<field>.has_value()` and publish to e
 
 === Running the Host Tests
 
-A CMake + GoogleTest harness at `tests/cpp/` compiles the parser, message buffer, commands, and the full hub state machine on the host and runs 200+ tests (fixture-based parser tests plus targeted behavior tests for the buffer, dispatch, and reconnect logic). Fixtures live at `tests/fixtures/` - one `.json` + one `.expected.json` per captured BLE payload.
-A CMake + GoogleTest harness at `tests/cpp/` compiles the parser on the host and runs 210 tests (32 fixture-based + targeted behavior tests covering dispatch, protocol parsing, and the hub state machine). Fixtures live at `tests/fixtures/` - one `.json` + one `.expected.json` per captured BLE payload.
+A CMake + GoogleTest harness at `tests/cpp/` compiles the parser, message buffer, commands, and the full hub state machine on the host and runs 230+ tests (32 fixture-based parser tests plus targeted behavior tests for the buffer, dispatch, and reconnect logic). Fixtures live at `tests/fixtures/` - one `.json` + one `.expected.json` per captured BLE payload.
 
 [source,bash]
 ----

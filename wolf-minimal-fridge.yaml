@@ -32,9 +32,12 @@ logger:
 
 api:
   reboot_timeout: 5min
+  encryption:
+    key: !secret encryption_key
 
 ota:
   - platform: esphome
+    password: !secret ota_password
 
 wifi:
   ssid: !secret wifi_ssid

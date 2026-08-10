@@ -85,11 +85,12 @@ inline void publish_if(esphome::text_sensor::TextSensor *s,
 // below are recomputed once per *contributing field*, so a full poll
 // would otherwise re-publish appliance_mode 4x and ice_maker_mode 3x per
 // cycle (each firing callbacks, a log line, an API message, and an HA
-// history row).
+// history row). Select has no public `state` member (unlike TextSensor);
+// the current value is exposed as a StringRef via current_option().
 inline void publish_if(esphome::select::Select *s, const std::string &v) {
   if (s == nullptr)
     return;
-  if (s->has_state() && s->state == v)
+  if (s->has_state() && s->current_option() == v)
     return;
   s->publish_state(v);
 }

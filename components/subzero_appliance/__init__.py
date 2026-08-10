@@ -1370,10 +1370,13 @@ def _schema_for_type(type_: str) -> cv.Schema:
         ): cv.positive_time_period_milliseconds,
         # not_null: poll_interval 0s would pass set_interval(0), which
         # fires every main-loop pass — an unlock + poll write per loop
-        # iteration floods the BLE link and the appliance.
+        # iteration floods the BLE link and the appliance. Order matters:
+        # the milliseconds validator must run LAST so the stored value is
+        # a TimePeriodMilliseconds (what codegen's safe_exp can emit);
+        # positive_not_null_time_period returns a plain TimePeriod.
         cv.Optional(CONF_POLL_INTERVAL, default="60s"): cv.All(
-            cv.positive_time_period_milliseconds,
             cv.positive_not_null_time_period,
+            cv.positive_time_period_milliseconds,
         ),
     }
     base.update(TYPE_SCHEMAS[type_])

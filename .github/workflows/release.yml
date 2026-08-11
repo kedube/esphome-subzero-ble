@@ -22,6 +22,11 @@ on:
         required: false
         default: false
         type: boolean
+      allow_first_release:
+        description: "Start versioning at v0.1.0 (only when the repo has no tags yet)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -82,9 +87,27 @@ jobs:
       - name: Get current version
         id: current
         run: |
+          set -euo pipefail
+          # actions/checkout fetches tags with fetch-depth: 0, but a fork
+          # created without them (or a repo whose tags were never pushed)
+          # yields an empty list. Silently falling back to v0.0.0 there
+          # would restart versioning at v0.1.0 and publish a release that
+          # sorts *below* every existing one, so require an explicit
+          # opt-in for the genuine first release instead.
           CURRENT=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)
-          echo "version=${CURRENT:-v0.0.0}" >> "$GITHUB_OUTPUT"
-          echo "Current version: ${CURRENT:-v0.0.0}"
+          if [ -z "$CURRENT" ]; then
+            if [ "${ALLOW_FIRST_RELEASE}" = "true" ]; then
+              CURRENT="v0.0.0"
+              echo "::warning::No version tags found; starting from v0.0.0 (first release opt-in)."
+            else
+              echo "::error::No version tags found in this repository. If this is a fork, push the upstream tags first (git push origin --tags). If this really is the first release, re-run with 'Allow first release' checked."
+              exit 1
+            fi
+          fi
+          echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "Current version: ${CURRENT}"
+        env:
+          ALLOW_FIRST_RELEASE: ${{ inputs.allow_first_release }}
 
       - name: Calculate new version
         id: new

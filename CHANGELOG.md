@@ -19,6 +19,8 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+## [3.8.0] - 2026-08-11
+
 ### Security
 
 - Sanitize every device-supplied string before it reaches Home Assistant.
@@ -103,3 +105,4 @@ after a release — the workflow expects it.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to
   Node 24 releases.
+

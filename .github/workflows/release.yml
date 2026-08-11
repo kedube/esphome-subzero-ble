@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      dry_run:
+        description: "Preview the release notes without tagging or publishing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,6 +34,50 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # Gate: never tag a commit whose CI didn't pass.
+      # ------------------------------------------------------------------
+      - name: Require successful CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Wait out an in-progress run rather than racing it: a release is
+          # usually dispatched right after a push, so CI is often still going.
+          DEADLINE=$(( SECONDS + 1800 ))
+          while true; do
+            RUN=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "CI")]
+                    | sort_by(.created_at) | last
+                    | "\(.status) \(.conclusion // "none") \(.html_url)"' || true)
+
+            if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
+              echo "::error::No CI run found for ${GITHUB_SHA}. Push the commit and let CI run before releasing."
+              exit 1
+            fi
+
+            STATUS=$(echo "$RUN" | cut -d' ' -f1)
+            CONCLUSION=$(echo "$RUN" | cut -d' ' -f2)
+            URL=$(echo "$RUN" | cut -d' ' -f3)
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "CI passed for ${GITHUB_SHA}: $URL"
+                break
+              fi
+              echo "::error::CI concluded '${CONCLUSION}' for ${GITHUB_SHA}: $URL"
+              exit 1
+            fi
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after 30m waiting for CI on ${GITHUB_SHA}: $URL"
+              exit 1
+            fi
+            echo "CI is ${STATUS}; waiting 30s... ($URL)"
+            sleep 30
+          done
 
       - name: Get current version
         id: current
@@ -53,6 +102,17 @@ jobs:
           NEW="v${MAJOR}.${MINOR}.${PATCH}"
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "New version: $NEW"
+
+      # ------------------------------------------------------------------
+      # Notes: Highlights come from CHANGELOG.md's Unreleased section.
+      # Extract BEFORE tagging so an empty section fails the run early.
+      # ------------------------------------------------------------------
+      - name: Extract Highlights from CHANGELOG
+        run: |
+          python3 scripts/changelog.py extract > /tmp/highlights.md
+          echo "::group::Highlights"
+          cat /tmp/highlights.md
+          echo "::endgroup::"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -89,21 +149,72 @@ jobs:
           # Restore the originals so the later sed/commit step operates on clean files.
           git checkout -- cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
 
+      - name: Preview release notes (dry run)
+        if: inputs.dry_run
+        run: |
+          python3 scripts/release_notes.py \
+            --version "${{ steps.new.outputs.version }}" \
+            --highlights /tmp/highlights.md \
+            --repo "${GITHUB_REPOSITORY}" \
+            --previous "${{ steps.current.outputs.version }}" \
+            --out /tmp/notes.md
+          {
+            echo "### Dry run — ${{ steps.new.outputs.version }} would be released with these notes"
+            echo
+            cat /tmp/notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: no tag created, no release published."
+
       - name: Create tag on current HEAD
+        if: ${{ !inputs.dry_run }}
         run: |
           git tag "${{ steps.new.outputs.version }}"
           git push origin "${{ steps.new.outputs.version }}"
 
+      - name: Build release notes
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Ask GitHub for its auto-generated commit list, then splice it in
+          # below our hand-written Highlights.
+          #
+          # previous_tag_name is deliberately omitted: the API rejects it
+          # (HTTP 400) unless that tag already has a *published release*,
+          # which isn't guaranteed here. Without it GitHub picks the previous
+          # release itself, falling back to a full commit link on the first
+          # release. release_notes.py supplies its own compare link if this
+          # call yields nothing.
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${{ steps.new.outputs.version }}" \
+            --jq '.body' > /tmp/generated.md || : > /tmp/generated.md
+
+          python3 scripts/release_notes.py \
+            --version "${{ steps.new.outputs.version }}" \
+            --highlights /tmp/highlights.md \
+            --generated /tmp/generated.md \
+            --repo "${GITHUB_REPOSITORY}" \
+            --previous "${{ steps.current.outputs.version }}" \
+            --out /tmp/notes.md
+
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ steps.new.outputs.version }}" \
-            --generate-notes \
+            --notes-file /tmp/notes.md \
             --title "${{ steps.new.outputs.version }}" \
             ${{ inputs.prerelease && '--prerelease' || '' }}
+          {
+            echo "### Released ${{ steps.new.outputs.version }}"
+            echo
+            cat /tmp/notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Update version references
+      - name: Update version references and roll CHANGELOG
+        if: ${{ !inputs.dry_run }}
         run: |
           NEW="${{ steps.new.outputs.version }}"
           sed -i "s/ref: v[0-9]*\.[0-9]*\.[0-9]*/ref: ${NEW}/g" \
@@ -112,8 +223,12 @@ jobs:
             cove-minimal-dishwasher.yaml \
             ci-fridge-write-support.yaml \
             README.adoc
+          # Stamp the shipped entries with this version and leave a fresh
+          # empty Unreleased section for the next cycle.
+          python3 scripts/changelog.py roll "${NEW}"
 
       - name: Create version bump PR
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -124,9 +239,9 @@ jobs:
           git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && exit 0
-          git commit -m "chore: bump version refs to ${NEW}"
+          git commit -m "chore: bump version refs to ${NEW} and roll CHANGELOG"
           git push -u origin "$BRANCH"
           gh pr create \
-            --title "chore: bump version refs to ${NEW}" \
-            --body "Auto-generated by the release workflow. Updates all \`ref:\` entries to \`${NEW}\`." \
+            --title "chore: bump version refs to ${NEW} and roll CHANGELOG" \
+            --body "Auto-generated by the release workflow. Updates all \`ref:\` entries to \`${NEW}\` and moves the CHANGELOG's Unreleased entries into a \`${NEW}\` section." \
             --label "automated"

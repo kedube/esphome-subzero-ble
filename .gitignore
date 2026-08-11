@@ -14,8 +14,11 @@
 !.github/ISSUE_TEMPLATE/**
 !.github/FUNDING.yml
 !README.adoc
+!CHANGELOG.md
 !docs/
 !docs/*.adoc
+!scripts/
+!scripts/*.py
 !secrets-example.yaml
 !cove-minimal-dishwasher.yaml
 !wolf-minimal-range.yaml

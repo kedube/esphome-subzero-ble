@@ -218,6 +218,38 @@ First run fetches ArduinoJson, GoogleTest, and nlohmann/json via CMake's `FetchC
 
 To add a fixture for a new appliance variant: turn on *Debug Mode*, concatenate the `Response[N/M]:` lines from the ESPHome logs (grep `Response\[` and stitch in order) into `tests/fixtures/<name>.json`, then record the expected parser output in `tests/fixtures/<name>.expected.json`. The test discovery picks up new pairs automatically.
 
+== Cutting a Release
+
+Releases are cut by the *Release* workflow (Actions -> Release -> Run workflow). It never tags a commit that CI hasn't blessed: the first step looks up the CI run for the exact commit being released and aborts if that run failed, is missing, or never completed. An in-progress run is waited out for up to 30 minutes.
+
+=== Writing the release notes
+
+The *Highlights* section of every release comes from the `## [Unreleased]` section of `CHANGELOG.md`, so the notes are written and reviewed as part of normal PRs rather than improvised at release time. Add an entry whenever you merge something a user would care about, grouped under `### Added`, `### Changed`, `### Fixed`, `### Security`, `### Performance`, or `### Removed`.
+
+Write for someone deciding whether to upgrade - what changed and why it matters, not which files moved. The workflow *fails* if the Unreleased section is empty, which is deliberate: a release with no notes is almost always an accident.
+
+=== What the workflow does
+
+. Verifies CI passed on the commit being released.
+. Extracts the Unreleased entries (aborting early if there are none).
+. Validates all four example configs with `esphome config`.
+. Tags `vX.Y.Z` and publishes a release whose body is *Highlights* (your entries) + *What's Changed* (GitHub's auto-generated commit list) + an *Upgrading* snippet.
+. Opens a follow-up PR that bumps every `ref:` in the example configs and README to the new tag, and rewrites the CHANGELOG's Unreleased entries as a dated `vX.Y.Z` section.
+
+Tick *Preview the release notes without tagging or publishing* to dry-run: the assembled markdown is written to the workflow summary and nothing is tagged or published. Use this to proofread the notes before committing to a version number.
+
+=== The helper scripts
+
+`scripts/changelog.py` reads and rolls the CHANGELOG (`extract` prints the Unreleased body; `roll vX.Y.Z` stamps it with a version and date and leaves a fresh empty section). `scripts/release_notes.py` assembles the final markdown. Both run standalone, so you can preview the exact release body locally:
+
+[source,bash]
+----
+python3 scripts/changelog.py extract > /tmp/highlights.md
+python3 scripts/release_notes.py \
+  --version v3.8.0 --highlights /tmp/highlights.md \
+  --repo <owner>/<repo> --previous v3.7.0 --out /tmp/notes.md
+----
+
 == Debug Mode
 
 Each appliance exposes a *Debug Mode* switch and a *Log Debug Info* button in Home Assistant (both under diagnostic entities).

@@ -9,7 +9,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import esp32
 
-CODEOWNERS = ["@JonGilmore"]
+CODEOWNERS = ["@kedube"]
 DEPENDENCIES = ["esp32"]
 
 # No framework validator on purpose: cv.only_with_esp_idf is deprecated

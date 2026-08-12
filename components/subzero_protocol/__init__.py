@@ -10,7 +10,7 @@ and publish the returned struct fields to ESPHome entities.
 import esphome.codegen as cg
 import esphome.config_validation as cv
 
-CODEOWNERS = ["@JonGilmore"]
+CODEOWNERS = ["@kedube"]
 DEPENDENCIES = ["json"]
 
 subzero_protocol_ns = cg.esphome_ns.namespace("subzero_protocol")

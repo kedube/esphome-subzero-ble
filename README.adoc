@@ -35,7 +35,7 @@ pip install esphome
 
 === 2. Create Your Config
 
-Create a YAML file (e.g. `subzero.yaml`). The `external_components:` block pulls the native `subzero_appliance` component directly from this GitHub repo at compile time - no cloning required. Each appliance is then declared as a single `subzero_appliance:` entry that creates its full set of sensors, switches, numbers, buttons, and the diagnostic Status text sensor.
+Create a YAML file (e.g. `subzero.yaml`). The `external_components:` block pulls the native `subzero_appliance` component directly from this GitHub repo at compile time - no cloning required. If you start from the repo's example, keep the platform/base settings in `subzero-example.yaml` and edit `settings-example.yaml` for appliance MACs, PINs, names, and per-appliance options. Each appliance is declared as a single `subzero_appliance:` entry that creates its full set of sensors, switches, numbers, buttons, and the diagnostic Status text sensor.
 
 Each `subzero_appliance:` entry also auto-creates an ESPHome sub-device using the appliance config `id` with `_device` appended, so entities are grouped per appliance in Home Assistant and the ESPHome web UI without needing a separate manual `esphome.devices:` block.
 
@@ -56,8 +56,8 @@ Pick the appropriate `type:` for your appliance:
 external_components:                          # <1>
   - source:
       type: git
-      url: https://github.com/JonGilmore/esphome-subzero-ble
-      ref: v3.7.0 # use latest tag, or main
+      url: https://github.com/kedube/esphome-subzero-ble
+      ref: main
     components: [patch_acl_reassembly, subzero_protocol, subzero_appliance]
 
 esphome:
@@ -154,7 +154,7 @@ subzero_appliance:
 
 NOTE: `esp32_ble: max_connections: 5` supports up to 5 concurrent appliances on one ESP32. Bump it (and see link:docs/advanced.adoc#ble-stack-tuning[BLE Stack Tuning] for additional `sdkconfig_options`) if you need more.
 
-TIP: Pin to a release tag (e.g. `ref: v3.7.0`) for stability, or use `ref: main` to track the latest changes. The minimal copy-paste examples in `wolf-minimal-fridge.yaml`, `wolf-minimal-range.yaml`, and `cove-minimal-dishwasher.yaml` in the repo root pin the latest release tag and are a known-good starting point.
+TIP: The multi-appliance `subzero-example.yaml` in the repo root tracks `main`; edit `settings-example.yaml` for appliance MACs, PINs, names, and per-appliance options. The release workflow keeps the `sw_version` substitution in that settings file stamped. If you prefer fully reproducible builds, change `ref: main` to a release tag such as `ref: v3.8.0`.
 
 ==== Fridge-Only Options
 

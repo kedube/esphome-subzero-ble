@@ -128,8 +128,8 @@ body:
           - id: main_fridge
             name: Main Fridge
             type: fridge
-            mac_address: !secret main_fridge_mac
-            pin: !secret main_fridge_pin
+            mac_address: "00:06:80:XX:XX:XX"
+            pin: "REPLACE_ME_6_DIGITS"
     validations:
       required: false
 

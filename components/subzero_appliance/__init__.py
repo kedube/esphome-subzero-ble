@@ -4,11 +4,11 @@ Native ESPHome component for Sub-Zero / Wolf / Cove BLE appliances.
 User YAML shape:
 
     external_components:
-      - source: github://JonGilmore/esphome-subzero-ble@main
+      - source: github://kedube/esphome-subzero-ble@main
         components: [patch_acl_reassembly, subzero_protocol, subzero_appliance]
 
     ble_client:
-      - mac_address: !secret main_fridge_mac
+      - mac_address: "00:06:80:XX:XX:XX"
         id: main_fridge_ble
         name: "SZG Main Fridge"
         auto_connect: true
@@ -18,7 +18,7 @@ User YAML shape:
         id: main_fridge
         ble_client_id: main_fridge_ble
         name: "Main Fridge"
-        pin: !secret main_fridge_pin
+        pin: "REPLACE_ME_6_DIGITS"
         # type-specific:
         hide_freezer: true
         hide_ice_maker: true
@@ -71,7 +71,7 @@ from esphome.const import (
 )
 from esphome.core.config import Device
 
-CODEOWNERS = ["@JonGilmore"]
+CODEOWNERS = ["@kedube"]
 DEPENDENCIES = ["ble_client"]
 AUTO_LOAD = [
     "binary_sensor",

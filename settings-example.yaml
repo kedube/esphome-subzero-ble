@@ -1,0 +1,75 @@
+# Edit this file for your appliance inventory.
+
+substitutions:
+  device_name: "subzero-gateway"
+  friendly_name: "Sub-Zero Gateway"
+  device_description: "ESPHome Gateway for Sub-Zero/Wolf/Cove Appliances"
+  device_area: "Kitchen"
+  sw_version: "3.8.0"
+  ble_max_connections: "5"
+
+ble_client:
+  - mac_address: "00:06:80:XX:XX:XX"
+    id: main_fridge_ble
+    name: "SZG Main Fridge"
+    auto_connect: true
+  - mac_address: "00:06:80:XX:XX:XX"
+    id: wine_cooler_ble
+    name: "SZG Wine Cooler"
+    auto_connect: true
+  - mac_address: "00:06:80:XX:XX:XX"
+    id: beverage_center_ble
+    name: "SZG Beverage Center"
+    auto_connect: true
+  - mac_address: "00:06:80:XX:XX:XX"
+    id: kitchen_range_ble
+    name: "SZG Kitchen Range"
+    auto_connect: true
+  - mac_address: "00:06:80:XX:XX:XX"
+    id: right_dishwasher_ble
+    name: "SZG Right Dishwasher"
+    auto_connect: true
+
+subzero_appliance:
+  - type: fridge
+    id: main_fridge
+    ble_client_id: main_fridge_ble
+    name: "Main Fridge"
+    pin: "REPLACE_ME_6_DIGITS"
+    poll_offset: 0s
+    hide_air_filter: false
+    hide_water_filter: false
+    hide_water_filter_extra: true
+    enable_temp_control: true
+    enable_mode_selects: true
+  - type: fridge
+    id: wine_cooler
+    ble_client_id: wine_cooler_ble
+    name: "Wine Cooler"
+    pin: "REPLACE_ME_6_DIGITS"
+    poll_offset: 5s
+    hide_freezer: true
+    hide_ice_maker: true
+    hide_wine: false
+    hide_fridge_zone: true
+  - type: fridge
+    id: beverage_center
+    ble_client_id: beverage_center_ble
+    name: "Beverage Center"
+    pin: "REPLACE_ME_6_DIGITS"
+    poll_offset: 10s
+    hide_freezer: true
+    hide_ice_maker: true
+  - type: range
+    id: kitchen_range
+    ble_client_id: kitchen_range_ble
+    name: "Kitchen Range"
+    pin: "REPLACE_ME_6_DIGITS"
+    poll_offset: 15s
+    hide_oven2: false
+  - type: dishwasher
+    id: right_dishwasher
+    ble_client_id: right_dishwasher_ble
+    name: "Right Dishwasher"
+    pin: "REPLACE_ME_6_DIGITS"
+    poll_offset: 20s

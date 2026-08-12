@@ -64,12 +64,8 @@ jobs:
           cat > secrets.yaml <<'EOF'
           wifi_ssid: "test-ssid"
           wifi_password: "test-password"
-          right_dishwasher_mac: "00:06:80:00:00:01"
-          right_dishwasher_pin: "000001"
-          kitchen_range_mac: "00:06:80:00:00:02"
-          kitchen_range_pin: "000002"
-          main_fridge_mac: "00:06:80:00:00:03"
-          main_fridge_pin: "000003"
+          ap_wifi_ssid: "SubZero CI Fallback"
+          ap_wifi_password: "test-password"
           ota_password: "ci-dummy-ota-password"
           encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
           EOF
@@ -92,13 +88,24 @@ jobs:
           REF=$(printf '%s' "$REF" | sed -e 's/[\&#]/\\&/g')
           REPO=$(printf '%s' "$REPO" | sed -e 's/[\&#]/\\&/g')
           sed -i -E "s#url: https://github.com/[^[:space:]]+#url: https://github.com/${REPO}#" \
-            cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
+            subzero-example.yaml
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" \
-            cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml
+            subzero-example.yaml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("settings-example.yaml")
+          text = path.read_text()
+          for i in range(text.count("00:06:80:XX:XX:XX")):
+              text = text.replace("00:06:80:XX:XX:XX", f"00:06:80:00:00:{i + 1:02X}", 1)
+          for i in range(text.count("REPLACE_ME_6_DIGITS")):
+              text = text.replace("REPLACE_ME_6_DIGITS", f"{i + 1:06d}", 1)
+          path.write_text(text)
+          PY
 
       - name: Validate configs
         run: |
-          for yaml in cove-minimal-dishwasher.yaml wolf-minimal-range.yaml wolf-minimal-fridge.yaml ci-fridge-write-support.yaml; do
+          for yaml in subzero-example.yaml; do
             echo "::group::Validating $yaml"
             esphome config "$yaml"
             echo "::endgroup::"
@@ -112,10 +119,7 @@ jobs:
       fail-fast: false
       matrix:
         file:
-          - cove-minimal-dishwasher.yaml
-          - wolf-minimal-range.yaml
-          - wolf-minimal-fridge.yaml
-          - ci-fridge-write-support.yaml
+          - subzero-example.yaml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -131,12 +135,8 @@ jobs:
           cat > secrets.yaml <<'EOF'
           wifi_ssid: "test-ssid"
           wifi_password: "test-password"
-          right_dishwasher_mac: "00:06:80:00:00:01"
-          right_dishwasher_pin: "000001"
-          kitchen_range_mac: "00:06:80:00:00:02"
-          kitchen_range_pin: "000002"
-          main_fridge_mac: "00:06:80:00:00:03"
-          main_fridge_pin: "000003"
+          ap_wifi_ssid: "SubZero CI Fallback"
+          ap_wifi_password: "test-password"
           ota_password: "ci-dummy-ota-password"
           encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
           EOF
@@ -157,6 +157,17 @@ jobs:
           REPO=$(printf '%s' "$REPO" | sed -e 's/[\&#]/\\&/g')
           sed -i -E "s#url: https://github.com/[^[:space:]]+#url: https://github.com/${REPO}#" "${{ matrix.file }}"
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" "${{ matrix.file }}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("settings-example.yaml")
+          text = path.read_text()
+          for i in range(text.count("00:06:80:XX:XX:XX")):
+              text = text.replace("00:06:80:XX:XX:XX", f"00:06:80:00:00:{i + 1:02X}", 1)
+          for i in range(text.count("REPLACE_ME_6_DIGITS")):
+              text = text.replace("REPLACE_ME_6_DIGITS", f"{i + 1:06d}", 1)
+          path.write_text(text)
+          PY
 
       - name: Compile ${{ matrix.file }}
         run: esphome compile "${{ matrix.file }}"

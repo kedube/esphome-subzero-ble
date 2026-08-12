@@ -13,9 +13,8 @@ esphome:
   friendly_name: ${friendly_name}
   comment: ${device_description}
   area: ${device_area}
-  platformio_options:
-    build_flags:
-      - "-DBOARD_HAS_PSRAM"
+  build_flags:
+    - "-DBOARD_HAS_PSRAM"
 
 esp32:
   board: esp32-s3-devkitc-1

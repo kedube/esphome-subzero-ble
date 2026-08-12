@@ -146,6 +146,7 @@ jobs:
 
       - name: Create dummy secrets
         run: |
+          cp settings-example.yaml settings.yaml
           cat > secrets.yaml <<'EOF'
           wifi_ssid: "test-ssid"
           wifi_password: "test-password"
@@ -159,11 +160,11 @@ jobs:
         run: |
           REF="${GITHUB_SHA}"
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" \
-            subzero-example.yaml
+            subzero.yaml
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("settings-example.yaml")
+          path = Path("settings.yaml")
           text = path.read_text()
           for i in range(text.count("00:06:80:XX:XX:XX")):
               text = text.replace("00:06:80:XX:XX:XX", f"00:06:80:00:00:{i + 1:02X}", 1)
@@ -171,13 +172,13 @@ jobs:
               text = text.replace("REPLACE_ME_6_DIGITS", f"{i + 1:06d}", 1)
           path.write_text(text)
           PY
-          for yaml in subzero-example.yaml; do
+          for yaml in subzero.yaml; do
             echo "::group::Validating $yaml"
             esphome config "$yaml"
             echo "::endgroup::"
           done
-          # Restore the originals so the later sed/commit step operates on clean files.
-          git checkout -- subzero-example.yaml settings-example.yaml
+          # Restore the original so the later sed/commit step operates on a clean file.
+          git checkout -- subzero.yaml
 
       - name: Preview release notes (dry run)
         if: inputs.dry_run

@@ -21,7 +21,7 @@
 !scripts/*.py
 !secrets-example.yaml
 !settings-example.yaml
-!subzero-example.yaml
+!subzero.yaml
 !components/
 !components/patch_acl_reassembly/
 !components/patch_acl_reassembly/**

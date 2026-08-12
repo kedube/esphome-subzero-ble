@@ -232,9 +232,9 @@ Write for someone deciding whether to upgrade - what changed and why it matters,
 
 . Verifies CI passed on the commit being released.
 . Extracts the Unreleased entries (aborting early if there are none).
-. Validates `subzero-example.yaml` with `esphome config`.
+. Validates `subzero-example.yaml` with `esphome config`. The validation step temporarily replaces the public placeholder MACs and PINs in `settings-example.yaml` with CI-only dummy values, then restores the file before any release-bump commit is prepared.
 . Tags `vX.Y.Z` and publishes a release whose body is *Highlights* (your entries) + *What's Changed* (GitHub's auto-generated commit list) + an *Upgrading* snippet.
-. Opens a follow-up PR that bumps `settings-example.yaml`'s `sw_version` and README version references to the new tag, and rewrites the CHANGELOG's Unreleased entries as a dated `vX.Y.Z` section.
+. Opens a follow-up PR that bumps `settings-example.yaml`'s `sw_version` to the new release number, updates README version references, and rewrites the CHANGELOG's Unreleased entries as a dated `vX.Y.Z` section. The normal CI workflow does not update `sw_version`; it only patches files inside the runner so validation and compile use the code under test.
 
 Tick *Preview the release notes without tagging or publishing* to dry-run: the assembled markdown is written to the workflow summary and nothing is tagged or published. Use this to proofread the notes before committing to a version number.
 

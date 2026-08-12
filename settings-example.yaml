@@ -5,7 +5,7 @@ substitutions:
   friendly_name: "Sub-Zero Gateway"
   device_description: "ESPHome Gateway for Sub-Zero/Wolf/Cove Appliances"
   device_area: "Kitchen"
-  sw_version: "3.8.0"
+  sw_version: "3.8.3"
   ble_max_connections: "5"
 
 ble_client:

@@ -27,18 +27,36 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
 jobs:
   release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       !contains(github.event.workflow_run.head_commit.message, 'chore: bump version refs') &&
+       !contains(github.event.workflow_run.head_commit.message, 'chore/bump-refs'))
     runs-on: ubuntu-latest
+    env:
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'patch' }}
+      RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      RELEASE_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+      ALLOW_FIRST_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_first_release || false }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       # ------------------------------------------------------------------
       # Gate: never tag a commit whose CI didn't pass.
@@ -53,13 +71,13 @@ jobs:
           DEADLINE=$(( SECONDS + 1800 ))
           while true; do
             RUN=$(gh api \
-              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&per_page=100" \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${RELEASE_SHA}&per_page=100" \
               --jq '[.workflow_runs[] | select(.name == "CI")]
                     | sort_by(.created_at) | last
                     | "\(.status) \(.conclusion // "none") \(.html_url)"' || true)
 
             if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
-              echo "::error::No CI run found for ${GITHUB_SHA}. Push the commit and let CI run before releasing."
+              echo "::error::No CI run found for ${RELEASE_SHA}. Push the commit and let CI run before releasing."
               exit 1
             fi
 
@@ -69,15 +87,15 @@ jobs:
 
             if [ "$STATUS" = "completed" ]; then
               if [ "$CONCLUSION" = "success" ]; then
-                echo "CI passed for ${GITHUB_SHA}: $URL"
+                echo "CI passed for ${RELEASE_SHA}: $URL"
                 break
               fi
-              echo "::error::CI concluded '${CONCLUSION}' for ${GITHUB_SHA}: $URL"
+              echo "::error::CI concluded '${CONCLUSION}' for ${RELEASE_SHA}: $URL"
               exit 1
             fi
 
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "::error::Timed out after 30m waiting for CI on ${GITHUB_SHA}: $URL"
+              echo "::error::Timed out after 30m waiting for CI on ${RELEASE_SHA}: $URL"
               exit 1
             fi
             echo "CI is ${STATUS}; waiting 30s... ($URL)"
@@ -106,8 +124,6 @@ jobs:
           fi
           echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
           echo "Current version: ${CURRENT}"
-        env:
-          ALLOW_FIRST_RELEASE: ${{ inputs.allow_first_release }}
 
       - name: Calculate new version
         id: new
@@ -116,10 +132,14 @@ jobs:
           VERSION="${VERSION#v}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
 
-          case "${{ inputs.bump }}" in
+          case "${RELEASE_BUMP}" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
+            *)
+              echo "::error::Unknown version bump '${RELEASE_BUMP}'"
+              exit 1
+              ;;
           esac
 
           NEW="v${MAJOR}.${MINOR}.${PATCH}"
@@ -158,7 +178,7 @@ jobs:
 
       - name: Validate configs before tagging
         run: |
-          REF="${GITHUB_SHA}"
+          REF="${RELEASE_SHA}"
           sed -i -E "s#ref: (v[0-9]+\.[0-9]+\.[0-9]+|main)#ref: ${REF}#" \
             subzero.yaml
           python3 - <<'PY'
@@ -181,7 +201,7 @@ jobs:
           git checkout -- subzero.yaml
 
       - name: Preview release notes (dry run)
-        if: inputs.dry_run
+        if: env.RELEASE_DRY_RUN == 'true'
         run: |
           python3 scripts/release_notes.py \
             --version "${{ steps.new.outputs.version }}" \
@@ -197,13 +217,13 @@ jobs:
           echo "Dry run: no tag created, no release published."
 
       - name: Create tag on current HEAD
-        if: ${{ !inputs.dry_run }}
+        if: env.RELEASE_DRY_RUN != 'true'
         run: |
           git tag "${{ steps.new.outputs.version }}"
           git push origin "${{ steps.new.outputs.version }}"
 
       - name: Build release notes
-        if: ${{ !inputs.dry_run }}
+        if: env.RELEASE_DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -230,14 +250,14 @@ jobs:
             --out /tmp/notes.md
 
       - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+        if: env.RELEASE_DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ steps.new.outputs.version }}" \
             --notes-file /tmp/notes.md \
             --title "${{ steps.new.outputs.version }}" \
-            ${{ inputs.prerelease && '--prerelease' || '' }}
+            ${{ env.RELEASE_PRERELEASE == 'true' && '--prerelease' || '' }}
           {
             echo "### Released ${{ steps.new.outputs.version }}"
             echo
@@ -245,7 +265,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update version references and roll CHANGELOG
-        if: ${{ !inputs.dry_run }}
+        if: env.RELEASE_DRY_RUN != 'true'
         run: |
           NEW="${{ steps.new.outputs.version }}"
           sed -i "s/ref: v[0-9]*\.[0-9]*\.[0-9]*/ref: ${NEW}/g" \
@@ -257,7 +277,7 @@ jobs:
           python3 scripts/changelog.py roll "${NEW}"
 
       - name: Create version bump PR
-        if: ${{ !inputs.dry_run }}
+        if: env.RELEASE_DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

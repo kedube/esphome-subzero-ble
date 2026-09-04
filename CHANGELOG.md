@@ -141,7 +141,7 @@ after a release — the workflow expects it.
   `sensor.<device>_uptime` and let it be recreated, and update any template or
   automation that parsed the old string. Firmware-truncated values
   (`627:09:3`, `1000:00:`) are handled; a malformed value publishes nothing.
-- Expand the host test suite to 266 tests, including regression coverage for
+- Expand the host test suite to 267 tests, including regression coverage for
   every connection-lifecycle and message-framing fix above.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to

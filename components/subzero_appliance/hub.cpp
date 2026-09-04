@@ -155,11 +155,22 @@ void SubzeroHub::handle_disconnected() {
   publish_progress_("Disconnected");
 }
 
-// Decode of the SMP status carried by ESP_GAP_BLE_AUTH_CMPL_EVT. Values
-// mirror esp_ble_auth_fail_rsn_t / the SMP spec's Pairing Failed reasons;
-// kept as a plain switch so the host test build doesn't need IDF headers.
+// Bluedroid does not hand ESPHome the raw SMP code. bta_dm_act.c reports
+// BTA_DM_AUTH_CONVERT_SMP_CODE(x) = HCI_ERR_MAX_ERR (0x43) + 10 + x, so a
+// wire-level SMP_REPEATED_ATTEMPTS (0x09) arrives as 86 (0x56). Anything at
+// or above the base is an offset SMP code; anything below is passed through
+// as-is. Kept IDF-header-free so the host test build still links.
+static constexpr int kBtaAuthFailBase = 0x43 + 10;
+
+static int auth_fail_smp_code(int reason) {
+  return reason >= kBtaAuthFailBase ? reason - kBtaAuthFailBase : reason;
+}
+
+// Decode of the (normalised) SMP status. 0x01-0x0E are the spec's Pairing
+// Failed reasons; 0x0F-0x19 are Bluedroid's internal extensions from
+// smp_api.h.
 static const char *auth_fail_reason_str(int reason) {
-  switch (reason) {
+  switch (auth_fail_smp_code(reason)) {
   case 0x01:
     return "PASSKEY_ENTRY_FAIL";
   case 0x02:
@@ -188,6 +199,28 @@ static const char *auth_fail_reason_str(int reason) {
     return "BR_EDR_PAIRING_IN_PROGRESS";
   case 0x0E:
     return "CROSS_TRANSPORT_KEY_GEN_NOT_ALLOWED";
+  case 0x0F:
+    return "PAIR_INTERNAL_ERR";
+  case 0x10:
+    return "UNKNOWN_IO_CAP";
+  case 0x11:
+    return "INIT_FAIL";
+  case 0x12:
+    return "CONFIRM_FAIL";
+  case 0x13:
+    return "BUSY";
+  case 0x14:
+    return "ENC_FAIL";
+  case 0x15:
+    return "STARTED";
+  case 0x16:
+    return "RSP_TIMEOUT";
+  case 0x17:
+    return "DIV_NOT_AVAIL";
+  case 0x18:
+    return "FAIL";
+  case 0x19:
+    return "CONN_TOUT (link dropped mid-pairing)";
   default:
     return "UNKNOWN";
   }
@@ -207,10 +240,11 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
     publish_pairing_error_("None");
     return;
   }
-  HUB_LOGE("ble", "[%s] SMP bond FAILED reason=0x%02X (%s)", name_.c_str(),
-           fail_reason, auth_fail_reason_str(fail_reason));
+  const int smp = auth_fail_smp_code(fail_reason);
+  HUB_LOGE("ble", "[%s] SMP bond FAILED reason=%d (SMP 0x%02X %s)",
+           name_.c_str(), fail_reason, smp, auth_fail_reason_str(fail_reason));
   char reason[64];
-  std::snprintf(reason, sizeof(reason), "0x%02X %s", fail_reason,
+  std::snprintf(reason, sizeof(reason), "0x%02X %s", smp,
                 auth_fail_reason_str(fail_reason));
   publish_pairing_error_(reason);
   char status[80];

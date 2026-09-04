@@ -479,8 +479,19 @@ TEST_F(HubFixture, AuthComplete_FailurePublishesDecodedReason) {
 }
 
 TEST_F(HubFixture, AuthComplete_UnknownReasonStillReportsCode) {
-  hub_.handle_auth_complete(false, 0x7F, 0);
-  EXPECT_EQ(status_log_.back(), "Pairing failed (0x7F UNKNOWN)");
+  hub_.handle_auth_complete(false, 0x3F, 0);
+  EXPECT_EQ(status_log_.back(), "Pairing failed (0x3F UNKNOWN)");
+}
+
+// Bluedroid's BTA layer reports HCI_ERR_MAX_ERR + 10 + <SMP code>, so the
+// values ESPHome logs as "auth fail reason=86" / "=102" are SMP 0x09 and
+// SMP 0x19. Both were seen live on a Sub-Zero fridge and a Wolf range.
+TEST_F(HubFixture, AuthComplete_DecodesBtaOffsetSmpCodes) {
+  hub_.handle_auth_complete(false, 86, 0);
+  EXPECT_EQ(status_log_.back(), "Pairing failed (0x09 REPEATED_ATTEMPTS)");
+  hub_.handle_auth_complete(false, 102, 0);
+  EXPECT_EQ(status_log_.back(),
+            "Pairing failed (0x19 CONN_TOUT (link dropped mid-pairing))");
 }
 
 // Status gets overwritten by reconnect chatter seconds after a bond

@@ -44,7 +44,7 @@ def build(
         f"      type: git\n"
         f"      url: https://github.com/{repo}\n"
         f"      ref: {version}\n"
-        f"    components: [ patch_acl_reassembly, subzero_protocol, subzero_appliance ]\n"
+        f"    components: [ subzero_protocol, subzero_appliance ]\n"
         f"```\n\n"
         f"See the [full changelog]"
         f"(https://github.com/{repo}/blob/{version}/CHANGELOG.md) for every "

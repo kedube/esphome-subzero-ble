@@ -23,8 +23,6 @@
 !settings-example.yaml
 !subzero.yaml
 !components/
-!components/patch_acl_reassembly/
-!components/patch_acl_reassembly/**
 !components/subzero_protocol/
 !components/subzero_protocol/**
 !components/subzero_appliance/

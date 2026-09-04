@@ -3,7 +3,7 @@ external_components:
       type: git
       url: https://github.com/kedube/esphome-subzero-ble
       ref: main
-    components: [patch_acl_reassembly, subzero_protocol, subzero_appliance]
+    components: [subzero_protocol, subzero_appliance]
 
 packages:
   settings: !include settings.yaml
@@ -13,6 +13,10 @@ esphome:
   friendly_name: ${friendly_name}
   comment: ${device_description}
   area: ${device_area}
+  # Hard floor: 2026.7.1 is the first ESPHome built on ESP-IDF 5.5.5, which
+  # carries the upstream Bluedroid ACL-reassembly fix this project used to
+  # patch in itself via the (now removed) patch_acl_reassembly component.
+  min_version: 2026.7.1
   build_flags:
     - "-DBOARD_HAS_PSRAM"
 

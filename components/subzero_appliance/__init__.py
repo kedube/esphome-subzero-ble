@@ -5,7 +5,7 @@ User YAML shape:
 
     external_components:
       - source: github://kedube/esphome-subzero-ble@main
-        components: [patch_acl_reassembly, subzero_protocol, subzero_appliance]
+        components: [subzero_protocol, subzero_appliance]
 
     ble_client:
       - mac_address: "00:06:80:XX:XX:XX"

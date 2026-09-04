@@ -31,12 +31,6 @@ after a release — the workflow expects it.
 - Validate the PIN reported by the appliance (non-empty, digits only, 10 chars
   max). A malformed or empty `pin` field in a push message could previously
   overwrite a valid stored PIN and block all writes until the user re-paired.
-- Fail the build when the ESP-IDF ACL reassembly patch cannot be verified.
-  The pre-build script previously logged one line and continued unpatched,
-  silently reintroducing the Bluetooth fragmentation bug the component exists
-  to fix. It now hard-fails, checks that the target really is the Bluedroid
-  packet fragmenter, keeps a `.orig` backup of the shared framework file, and
-  writes atomically so an interrupted build cannot corrupt the toolchain.
 - Ship the example configurations with API encryption and an OTA password.
   Copying a quickstart config verbatim previously produced a device that
   accepted unauthenticated firmware uploads from anyone on the network.
@@ -95,6 +89,18 @@ after a release — the workflow expects it.
   re-published the appliance mode four times and the ice maker mode three times,
   each firing callbacks, a log line, an API message, and a Home Assistant
   history row.
+
+### Removed
+
+- **Breaking:** drop the `patch_acl_reassembly` component and require
+  ESPHome 2026.7.1 or newer (`esphome: min_version: 2026.7.1`). The Bluedroid
+  ACL continuation-fragment bug it worked around is fixed in ESP-IDF 5.5.5,
+  which ESPHome adopted in 2026.7.1. Against that framework the frozen patch
+  was a regression: it reverted upstream's stale-partial-packet cleanup and
+  would clobber any future change to `packet_fragmenter.c`. Remove
+  `patch_acl_reassembly` from your `external_components: components:` list;
+  referencing it now fails config validation. Backported from upstream
+  JonGilmore/esphome-subzero-ble PRs #111 and #114.
 
 ### Changed
 

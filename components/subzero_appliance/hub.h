@@ -62,6 +62,15 @@ public:
   // (caller should still call passkey_reply with 0 or skip).
   std::uint32_t handle_passkey_request();
 
+  // SMP bonding result (ESP_GAP_BLE_AUTH_CMPL_EVT). Without this the hub
+  // requested encryption and then blind-waited on a timer, so a bond that
+  // never completed was indistinguishable from one that completed but
+  // failed to expose D5/D6. On failure the decoded reason is published to
+  // the Status entity so a wrong PIN or an IO-capability mismatch is
+  // visible in HA instead of a silent retry loop. `fail_reason` is the raw
+  // SMP status from the IDF; see auth_fail_reason_str() for the decode.
+  void handle_auth_complete(bool success, int fail_reason, int auth_mode);
+
   // BLE indication arrivals (called from D5/D6 notify sensor lambdas).
   // D5 is the control channel — heartbeat only, resets zombie counter.
   // D6 is the data channel — accumulates fragments into json_buf_ and

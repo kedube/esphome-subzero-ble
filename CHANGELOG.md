@@ -35,6 +35,17 @@ after a release — the workflow expects it.
   Copying a quickstart config verbatim previously produced a device that
   accepted unauthenticated firmware uploads from anyone on the network.
 
+### Added
+
+- Report the Bluetooth bonding verdict. The hub now consumes the ESP-IDF
+  `AUTH_CMPL` event: a successful bond logs the negotiated auth mode
+  (bonding / MITM / Secure Connections bits), and a failed bond publishes the
+  decoded SMP reason to the Status entity, e.g. `Pairing failed (0x04
+  CONFIRM_VALUE_FAILED (wrong PIN))`. Previously a bond that never completed
+  and one that completed but exposed no data channel produced identical logs
+  and a silent reconnect loop. Adapted from upstream
+  JonGilmore/esphome-subzero-ble branch `diag/fw85-handshake`.
+
 ### Fixed
 
 - Stop the Status entity from spamming the Home Assistant logbook. HA writes
@@ -126,7 +137,7 @@ after a release — the workflow expects it.
   `sensor.<device>_uptime` and let it be recreated, and update any template or
   automation that parsed the old string. Firmware-truncated values
   (`627:09:3`, `1000:00:`) are handled; a malformed value publishes nothing.
-- Expand the host test suite to 260 tests, including regression coverage for
+- Expand the host test suite to 263 tests, including regression coverage for
   every connection-lifecycle and message-framing fix above.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to

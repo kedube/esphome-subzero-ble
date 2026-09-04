@@ -453,6 +453,34 @@ TEST_F(HubFixture, Passkey_NumericPin_ReturnsAtoiValue) {
 }
 
 // =============================================================================
+// SMP bonding result (ESP_GAP_BLE_AUTH_CMPL_EVT)
+// =============================================================================
+
+// A healthy bond is the expected steady state — log it, but don't turn it
+// into a Status change (and therefore an HA logbook row) on every connect.
+TEST_F(HubFixture, AuthComplete_SuccessPublishesNothing) {
+  hub_.handle_auth_complete(true, 0, 0x0D);
+  EXPECT_TRUE(status_log_.empty());
+}
+
+// A failed bond used to be invisible: the D5 ladder just timed out and the
+// hub reconnected. The decoded SMP reason must reach the Status entity.
+TEST_F(HubFixture, AuthComplete_FailurePublishesDecodedReason) {
+  hub_.handle_auth_complete(false, 0x04, 0);
+  ASSERT_FALSE(status_log_.empty());
+  EXPECT_EQ(status_log_.back(),
+            "Pairing failed (0x04 CONFIRM_VALUE_FAILED (wrong PIN))");
+
+  hub_.handle_auth_complete(false, 0x03, 0);
+  EXPECT_TRUE(last_status_contains("AUTH_REQ_UNMET"));
+}
+
+TEST_F(HubFixture, AuthComplete_UnknownReasonStillReportsCode) {
+  hub_.handle_auth_complete(false, 0x7F, 0);
+  EXPECT_EQ(status_log_.back(), "Pairing failed (0x7F UNKNOWN)");
+}
+
+// =============================================================================
 // Buttons
 // =============================================================================
 

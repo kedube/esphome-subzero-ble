@@ -4,6 +4,7 @@
 #include "../subzero_protocol/log_sanitize.h"
 #include "../subzero_protocol/protocol.h"
 
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -152,6 +153,65 @@ void SubzeroHub::handle_disconnected() {
     }
   }
   publish_progress_("Disconnected");
+}
+
+// Decode of the SMP status carried by ESP_GAP_BLE_AUTH_CMPL_EVT. Values
+// mirror esp_ble_auth_fail_rsn_t / the SMP spec's Pairing Failed reasons;
+// kept as a plain switch so the host test build doesn't need IDF headers.
+static const char *auth_fail_reason_str(int reason) {
+  switch (reason) {
+  case 0x01:
+    return "PASSKEY_ENTRY_FAIL";
+  case 0x02:
+    return "OOB_NOT_AVAILABLE";
+  case 0x03:
+    return "AUTH_REQ_UNMET (IO caps / MITM mismatch)";
+  case 0x04:
+    return "CONFIRM_VALUE_FAILED (wrong PIN)";
+  case 0x05:
+    return "PAIRING_NOT_SUPPORTED";
+  case 0x06:
+    return "ENCRYPTION_KEY_SIZE";
+  case 0x07:
+    return "COMMAND_NOT_SUPPORTED";
+  case 0x08:
+    return "UNSPECIFIED_REASON";
+  case 0x09:
+    return "REPEATED_ATTEMPTS";
+  case 0x0A:
+    return "INVALID_PARAMETERS";
+  case 0x0B:
+    return "DHKEY_CHECK_FAILED";
+  case 0x0C:
+    return "NUMERIC_COMPARISON_FAILED";
+  case 0x0D:
+    return "BR_EDR_PAIRING_IN_PROGRESS";
+  case 0x0E:
+    return "CROSS_TRANSPORT_KEY_GEN_NOT_ALLOWED";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
+                                      int auth_mode) {
+  if (success) {
+    // auth_mode is the esp_ble_auth_req_t bitmask actually negotiated:
+    // bit0 bonding, bit2 MITM, bit3 Secure Connections. Worth logging
+    // because we request MITM and newer firmware may change what it
+    // accepts. Log only — a healthy bond is not a Status change.
+    HUB_LOGI("ble",
+             "[%s] SMP bond OK (auth_mode=0x%02X: bond=%d mitm=%d sc=%d)",
+             name_.c_str(), auth_mode, (auth_mode & 0x01) ? 1 : 0,
+             (auth_mode & 0x04) ? 1 : 0, (auth_mode & 0x08) ? 1 : 0);
+    return;
+  }
+  HUB_LOGE("ble", "[%s] SMP bond FAILED reason=0x%02X (%s)", name_.c_str(),
+           fail_reason, auth_fail_reason_str(fail_reason));
+  char status[80];
+  std::snprintf(status, sizeof(status), "Pairing failed (0x%02X %s)",
+                fail_reason, auth_fail_reason_str(fail_reason));
+  publish_status_(status);
 }
 
 std::uint32_t SubzeroHub::handle_passkey_request() {

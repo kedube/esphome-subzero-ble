@@ -299,6 +299,9 @@ TIP: Sub-Zero appliance BLE MAC addresses typically begin with `00:06:80`. You c
 | *"No sensor characteristic found" warning*
 | Expected. ESPHome's BLE sensor component looks for D5 before encryption exposes it. The code injects the correct handle later.
 
+| *Status reads "Pairing failed (0x04 CONFIRM_VALUE_FAILED (wrong PIN))" or another `Pairing failed (0x..)` code*
+| The BLE bond itself was rejected by the appliance, before any data channel was reached. `0x04` means the PIN you entered does not match the one on the appliance display - re-check it (see <<pairing>>). `0x03 AUTH_REQ_UNMET` means the appliance and ESP32 disagree on pairing requirements (IO capability / MITM); keep `io_capability: keyboard_only` in your `esp32_ble:` block. Other codes are the raw SMP Pairing Failed reason, also written to the ESPHome log at `ERROR`.
+
 | *Passkey request but no PIN*
 | Enter your PIN via the text input in Home Assistant, then press "Submit PIN & Unlock."
 

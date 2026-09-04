@@ -13,10 +13,10 @@
 !.github/ISSUE_TEMPLATE/
 !.github/ISSUE_TEMPLATE/**
 !.github/FUNDING.yml
-!README.adoc
+!README.md
 !CHANGELOG.md
 !docs/
-!docs/*.adoc
+!docs/*.md
 !scripts/
 !scripts/*.py
 !secrets-example.yaml

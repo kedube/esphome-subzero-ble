@@ -365,7 +365,7 @@ jobs:
         run: |
           NEW="${{ steps.new.outputs.version }}"
           sed -i "s/ref: v[0-9]*\.[0-9]*\.[0-9]*/ref: ${NEW}/g" \
-            README.adoc
+            README.md
           sed -i -E "s/sw_version: \"[0-9]+\.[0-9]+\.[0-9]+\"/sw_version: \"${NEW#v}\"/" \
             settings-example.yaml
           # Stamp the shipped entries with this version and leave a fresh

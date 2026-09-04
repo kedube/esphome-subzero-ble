@@ -21,6 +21,12 @@ after a release — the workflow expects it.
 
 ### Changed
 
+- Rewrite the documentation in Markdown and condense it. `README.adoc`,
+  `docs/advanced.adoc`, and `docs/ble-protocol.adoc` are replaced by `.md`
+  files. The per-appliance example configurations are gone, since
+  `subzero.yaml` plus `settings-example.yaml` already cover every case; the
+  option tables, entity lists, and troubleshooting remain. Stale YAML-era
+  descriptions are updated to the native component's behaviour.
 - Derive the release bump from commit messages. After a green CI run on
   `main`, a `feat:` commit since the last tag produces a minor release, a
   `fix:`/`perf:` a patch, a `!`/`BREAKING CHANGE` a major, and pushes made up

@@ -89,12 +89,14 @@ void ApplianceBase::gattc_event_handler(esp_gattc_cb_event_t event,
   }
   case ESP_GATTC_WRITE_CHAR_EVT:
     if (param->write.status != ESP_GATT_OK) {
-      h->handle_write_failed(param->write.handle);
+      h->handle_write_failed(param->write.handle,
+                             static_cast<int>(param->write.status));
     }
     break;
   case ESP_GATTC_WRITE_DESCR_EVT:
     if (param->write.status != ESP_GATT_OK) {
-      h->handle_write_failed(param->write.handle);
+      h->handle_write_failed(param->write.handle,
+                             static_cast<int>(param->write.status));
     }
     break;
   case ESP_GATTC_NOTIFY_EVT: {

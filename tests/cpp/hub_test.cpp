@@ -488,7 +488,9 @@ TEST_F(HubFixture, AuthComplete_UnknownReasonStillReportsCode) {
 // SMP 0x19. Both were seen live on a Sub-Zero fridge and a Wolf range.
 TEST_F(HubFixture, AuthComplete_DecodesBtaOffsetSmpCodes) {
   hub_.handle_auth_complete(false, 86, 0);
-  EXPECT_EQ(status_log_.back(), "Pairing failed (0x09 REPEATED_ATTEMPTS)");
+  // REPEATED_ATTEMPTS also starts a back-off, whose status lands last.
+  EXPECT_TRUE(any_status_contains("Pairing failed (0x09 REPEATED_ATTEMPTS)"));
+  transport_.set_connected(true);
   hub_.handle_auth_complete(false, 102, 0);
   EXPECT_EQ(status_log_.back(),
             "Pairing failed (0x19 CONN_TOUT (link dropped mid-pairing))");
@@ -1195,11 +1197,11 @@ TEST_F(HubFixture, WriteFailStreak_ForcesColdRediscovery) {
   run_to_ready_();
   std::size_t disc_before = transport_.disconnect_count();
 
-  hub_.handle_write_failed(0x12);
-  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
   EXPECT_EQ(transport_.disconnect_count(), disc_before)
       << "Below the threshold, transient write failures must not reconnect.";
-  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
 
   EXPECT_GT(transport_.disconnect_count(), disc_before);
   EXPECT_EQ(hub_.d5_handle(), 0)
@@ -1213,18 +1215,188 @@ TEST_F(HubFixture, WriteFailStreak_ResetBySuccessfulParse) {
   run_to_ready_();
   std::size_t disc_before = transport_.disconnect_count();
 
-  hub_.handle_write_failed(0x12);
-  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
   // A successfully parsed message proves the link + handles work.
   std::string msg = "{\"status\":0,\"resp\":{\"foo\":1}}\n";
   hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(msg.data()),
                         msg.size());
-  hub_.handle_write_failed(0x12);
-  hub_.handle_write_failed(0x12);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInvalidHandle);
 
   EXPECT_EQ(transport_.disconnect_count(), disc_before)
       << "The streak must reset on a successful parse — only consecutive "
          "failures indicate stale handles.";
+}
+
+// A write rejected for insufficient authentication/encryption means the
+// link is not encrypted yet — not that the handles are stale. Seen live on
+// a Wolf range: CCCD writes 700 ms after request_encryption() failed, the
+// old code hit the streak threshold and disconnected mid-handshake.
+TEST_F(HubFixture, SecurityWriteFailure_RetriesSubscribeInsteadOfRediscovery) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  const std::size_t disc_before = transport_.disconnect_count();
+  const std::size_t enc_before = transport_.encryption_request_count();
+  const std::size_t subs_before = transport_.notify_subscribed_handles().size();
+
+  // CCCD D5, CCCD D6 and the unlock all bounce together.
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+  hub_.handle_write_failed(0x14, SubzeroHub::kGattInsufEncryption);
+  hub_.handle_write_failed(0x10, SubzeroHub::kGattInsufAuthentication);
+
+  EXPECT_EQ(transport_.disconnect_count(), disc_before)
+      << "Security rejections must never trigger the stale-handle teardown.";
+  EXPECT_NE(hub_.d5_handle(), 0);
+  EXPECT_TRUE(scheduler_.has_pending("encryption_retry"));
+
+  scheduler_.advance_by(SubzeroHub::kEncryptionRetryDelayMs);
+  EXPECT_EQ(transport_.encryption_request_count(), enc_before + 1);
+  EXPECT_GT(transport_.notify_subscribed_handles().size(), subs_before)
+      << "The subscribe stage must run again once the link had time to encrypt.";
+}
+
+TEST_F(HubFixture, SecurityWriteFailure_GivesUpAfterMaxRetriesAsBondStrike) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  const std::size_t disc_before = transport_.disconnect_count();
+
+  for (int i = 0; i < SubzeroHub::kMaxEncryptionRetries; ++i) {
+    hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+    scheduler_.advance_by(SubzeroHub::kEncryptionRetryDelayMs);
+  }
+  EXPECT_EQ(transport_.disconnect_count(), disc_before);
+
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+  EXPECT_GT(transport_.disconnect_count(), disc_before);
+  EXPECT_NE(hub_.d5_handle(), 0)
+      << "Handles stay cached: this is a bond problem, not a layout change, "
+         "so handle_disconnected() must count it toward the stale bond.";
+  EXPECT_TRUE(any_status_contains("Encryption not completing"));
+}
+
+TEST_F(HubFixture, SecurityWriteFailure_CounterResetsOnSuccessfulParse) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  for (int i = 0; i < SubzeroHub::kMaxEncryptionRetries; ++i) {
+    hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+    scheduler_.advance_by(SubzeroHub::kEncryptionRetryDelayMs);
+  }
+  std::string msg = "{\"status\":0,\"resp\":{\"foo\":1}}\n";
+  hub_.handle_d6_notify(reinterpret_cast<const std::uint8_t *>(msg.data()),
+                        msg.size());
+  const std::size_t disc_before = transport_.disconnect_count();
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+  EXPECT_EQ(transport_.disconnect_count(), disc_before);
+  EXPECT_TRUE(scheduler_.has_pending("encryption_retry"));
+}
+
+// A bonded appliance that now refuses the bond is the stale-bond case;
+// it must feed the same three-strikes recovery as a failed reconnect.
+TEST_F(HubFixture, AuthFailure_CountsAsStaleBondStrike) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  ASSERT_NE(hub_.d5_handle(), 0);
+
+  hub_.handle_auth_complete(false, 0x04, 0); // wrong PIN
+  EXPECT_EQ(hub_.fast_retries(), 1);
+  EXPECT_FALSE(hub_.post_bond_running());
+  EXPECT_FALSE(hub_.subscribe_running());
+  // The hub dropped the link itself and flagged it, so the disconnect
+  // callback must not count it a second time.
+  hub_.handle_disconnected();
+  EXPECT_EQ(hub_.fast_retries(), 1);
+
+  transport_.set_connected(true);
+  hub_.handle_auth_complete(false, 0x04, 0);
+  hub_.handle_disconnected();
+  EXPECT_EQ(hub_.fast_retries(), 2);
+
+  transport_.set_connected(true);
+  hub_.handle_auth_complete(false, 0x04, 0);
+  EXPECT_EQ(transport_.remove_bond_count(), 1u);
+  EXPECT_EQ(hub_.d5_handle(), 0);
+  EXPECT_EQ(hub_.phase(), 0);
+  EXPECT_TRUE(any_status_contains("Bond cleared"));
+}
+
+// The failure can arrive before post_bond_initial_ has read the handles
+// (the appliance sends a Security Request on connect). It must still be
+// recognised as a bonded appliance if D5 is visible.
+TEST_F(HubFixture, AuthFailure_BeforeHandlesRead_StillStrikes) {
+  hub_.set_stored_pin("12345");
+  transport_.set_gatt_db(full_gatt_db());
+  hub_.handle_connected(); // phase 1, handles not read yet
+  ASSERT_EQ(hub_.d5_handle(), 0);
+
+  hub_.handle_auth_complete(false, 86, 0); // REPEATED_ATTEMPTS, BTA offset
+  EXPECT_EQ(hub_.fast_retries(), 1);
+}
+
+// SMP REPEATED_ATTEMPTS is a lockout that only decays while we stop
+// redialing. The hub must disable the client for a doubling interval.
+TEST_F(HubFixture, RepeatedAttempts_BacksOffAndReenables) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  hub_.handle_auth_complete(false, 86, 0);
+  EXPECT_FALSE(transport_.enabled());
+  EXPECT_TRUE(scheduler_.has_pending("pairing_backoff"));
+  EXPECT_TRUE(last_status_contains("refusing pairing"));
+  // The disconnect the disable causes must not kill the back-off timer.
+  hub_.handle_disconnected();
+  EXPECT_TRUE(scheduler_.has_pending("pairing_backoff"));
+
+  scheduler_.advance_by(SubzeroHub::kPairingBackoffInitialMs - 1);
+  EXPECT_FALSE(transport_.enabled());
+  scheduler_.advance_by(2);
+  EXPECT_TRUE(transport_.enabled());
+
+  // Second refusal doubles the hold.
+  transport_.set_connected(true);
+  hub_.handle_auth_complete(false, 86, 0);
+  hub_.handle_disconnected();
+  scheduler_.advance_by(SubzeroHub::kPairingBackoffInitialMs + 1);
+  EXPECT_FALSE(transport_.enabled());
+  scheduler_.advance_by(SubzeroHub::kPairingBackoffInitialMs);
+  EXPECT_TRUE(transport_.enabled());
+}
+
+TEST_F(HubFixture, RepeatedAttempts_BackoffCapsAtMax) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  for (int i = 0; i < 6; ++i) {
+    transport_.set_connected(true);
+    hub_.handle_auth_complete(false, 86, 0);
+    hub_.handle_disconnected();
+    scheduler_.advance_by(SubzeroHub::kPairingBackoffMaxMs + 1);
+    EXPECT_TRUE(transport_.enabled()) << "iteration " << i;
+  }
+}
+
+TEST_F(HubFixture, PressConnect_ClearsPairingBackoff) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.handle_auth_complete(false, 86, 0);
+  ASSERT_FALSE(transport_.enabled());
+
+  hub_.press_connect();
+  EXPECT_TRUE(transport_.enabled());
+  EXPECT_FALSE(scheduler_.has_pending("pairing_backoff"));
+}
+
+// A successful bond (pairing case, where AUTH_CMPL does fire) must not sit
+// out the remainder of a pending subscribe retry.
+TEST_F(HubFixture, AuthSuccess_FiresPendingSubscribeRetryImmediately) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+  hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+  ASSERT_TRUE(scheduler_.has_pending("encryption_retry"));
+  const std::size_t subs_before = transport_.notify_subscribed_handles().size();
+
+  hub_.handle_auth_complete(true, 0, 0x0D);
+  EXPECT_FALSE(scheduler_.has_pending("encryption_retry"));
+  EXPECT_GT(transport_.notify_subscribed_handles().size(), subs_before);
 }
 
 // =============================================================================

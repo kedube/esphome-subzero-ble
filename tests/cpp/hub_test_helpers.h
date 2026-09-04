@@ -100,6 +100,12 @@ public:
     ++disconnect_count_;
     connected_ = false;
   }
+  void set_enabled(bool v) override {
+    enabled_ = v;
+    ++set_enabled_count_;
+    if (!v)
+      connected_ = false;
+  }
   void request_mtu() override { ++mtu_request_count_; }
   void request_encryption() override { ++encryption_request_count_; }
   void remove_bond() override { ++remove_bond_count_; }
@@ -142,6 +148,8 @@ public:
   const WriteCall &write_at(std::size_t i) const { return writes_.at(i); }
   std::size_t connect_count() const { return connect_count_; }
   std::size_t disconnect_count() const { return disconnect_count_; }
+  bool enabled() const { return enabled_; }
+  std::size_t set_enabled_count() const { return set_enabled_count_; }
   std::size_t mtu_request_count() const { return mtu_request_count_; }
   std::size_t encryption_request_count() const {
     return encryption_request_count_;
@@ -178,6 +186,8 @@ private:
 
   std::size_t connect_count_ = 0;
   std::size_t disconnect_count_ = 0;
+  bool enabled_ = true;
+  std::size_t set_enabled_count_ = 0;
   std::size_t mtu_request_count_ = 0;
   std::size_t encryption_request_count_ = 0;
   std::size_t remove_bond_count_ = 0;

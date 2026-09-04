@@ -84,7 +84,11 @@ public:
   // peer (e.g. the appliance rebooted with a different GATT layout), so
   // this event is the only place stale cached handles ever surface. A
   // streak of failures forces a cold rediscovery.
-  void handle_write_failed(std::uint16_t handle);
+  // `gatt_status` is the esp_gatt_status_t from the WRITE_*_EVT. Security
+  // rejections (insufficient authentication / encryption) mean the link is
+  // simply not encrypted yet and trigger a subscribe retry; anything else
+  // counts toward the stale-handle streak.
+  void handle_write_failed(std::uint16_t handle, int gatt_status);
 
   // Mark the next disconnect as deliberate (user pressed Disconnect, a
   // debug-triggered reconnect, etc.) so handle_disconnected() skips
@@ -147,6 +151,23 @@ public:
   // it rather than a Status frozen at "Connected and polling."
   // Public for the same reason as kSessionRefreshIntervalMs.
   static constexpr std::uint32_t kSessionRefreshQuietMaxMs = 90 * 1000;
+  // GATT status codes, mirroring esp_gatt_status_t so the host build stays
+  // IDF-header-free. Public so tests can drive handle_write_failed().
+  static constexpr int kGattInvalidHandle = 0x01;
+  static constexpr int kGattInsufAuthentication = 0x05;
+  static constexpr int kGattInsufAuthorization = 0x08;
+  static constexpr int kGattInsufKeySize = 0x0C;
+  static constexpr int kGattInsufEncryption = 0x0F;
+  static bool gatt_status_is_security(int status) {
+    return status == kGattInsufAuthentication ||
+           status == kGattInsufAuthorization || status == kGattInsufKeySize ||
+           status == kGattInsufEncryption;
+  }
+  // Public so tests can advance the fake scheduler past them.
+  static constexpr std::uint32_t kEncryptionRetryDelayMs = 2000;
+  static constexpr int kMaxEncryptionRetries = 5;
+  static constexpr std::uint32_t kPairingBackoffInitialMs = 60 * 1000;
+  static constexpr std::uint32_t kPairingBackoffMaxMs = 5 * 60 * 1000;
   // Status text callback — connected to ${prefix}_debug.publish_state.
   void set_status_callback(std::function<void(const std::string &)> cb) {
     status_cb_ = std::move(cb);
@@ -302,6 +323,18 @@ private:
   void write_set_property_(const std::string &key,
                            const std::string &json_value);
   void update_handles_from_db_();
+  // Re-runs the subscribe stage after a security-class write rejection,
+  // i.e. once the link has had time to finish encrypting. See
+  // handle_write_failed().
+  void encryption_retry_();
+  // One failed reconnect / bond attempt toward kStaleBondsThreshold.
+  // Returns true when the threshold was hit and the bond was cleared (the
+  // caller must not overwrite the "Bond cleared" status).
+  bool note_bond_failure_();
+  // Disable the BLE client for a doubling interval after the appliance
+  // rejected pairing with SMP REPEATED_ATTEMPTS; re-enabled by timer.
+  void start_pairing_backoff_();
+  void cancel_pairing_backoff_();
 
   // ---- collaborators (non-owning pointers, lifetime owned by caller) ----
   BleTransport *transport_ = nullptr;
@@ -346,6 +379,14 @@ private:
   // handle_write_failed(). Reset on disconnect and on any successfully
   // parsed message.
   int write_fail_streak_ = 0;
+  // Subscribe retries issued this session because writes were rejected
+  // for insufficient authentication/encryption. See handle_write_failed().
+  int enc_retry_count_ = 0;
+  bool enc_retry_pending_ = false;
+  // Current pairing back-off interval; 0 when not backing off. Doubles on
+  // each consecutive REPEATED_ATTEMPTS refusal, reset by a successful bond
+  // or a successfully parsed message.
+  std::uint32_t pairing_backoff_ms_ = 0;
   // Consecutive sessions that reached subscribe with no D6 handle — see
   // subscribe_initial_get_(). Reset when D6 is found and on full resets.
   int d6_missing_streak_ = 0;

@@ -52,6 +52,24 @@ after a release — the workflow expects it.
 
 ### Fixed
 
+- Stop tearing down a connection while it is still encrypting. GATT writes
+  rejected for insufficient authentication or encryption mean the link is not
+  encrypted *yet*; the stale-handle heuristic counted them and forced a cold
+  rediscovery about a second after requesting encryption, which cut the
+  security exchange short on a Wolf range (observed as SMP `CONN_TOUT`) and
+  turned every bond problem into a permanent 20-second reconnect loop. Those
+  rejections now retry the subscribe after 2 s, up to five times, before the
+  link is dropped; only handle-class errors feed the stale-handle streak.
+- Feed a failed bond into the stale-bond recovery. A bonded appliance that now
+  refuses pairing counts as a strike, so three in a row clear the bond and
+  re-pair automatically, as designed. Previously the write-failure path
+  cleared the cached handles first and the strike counter never moved.
+- Back off when an appliance is rate-limiting pairing. An SMP
+  `REPEATED_ATTEMPTS` refusal now disables the BLE client for a doubling
+  interval from 1 to 5 minutes (Status shows "Appliance refusing pairing,
+  retrying in N s"). That lockout only decays while the ESP32 stops redialing;
+  auto-connect was retrying every few seconds and keeping it alive
+  indefinitely. Pressing Connect or Reset Pairing clears the hold.
 - Stop the Status entity from spamming the Home Assistant logbook. HA writes
   a logbook row for every distinct value a text sensor publishes, and a
   healthy appliance produced roughly a thousand a day: "PIN confirmed" was
@@ -141,7 +159,7 @@ after a release — the workflow expects it.
   `sensor.<device>_uptime` and let it be recreated, and update any template or
   automation that parsed the old string. Firmware-truncated values
   (`627:09:3`, `1000:00:`) are handled; a malformed value publishes nothing.
-- Expand the host test suite to 267 tests, including regression coverage for
+- Expand the host test suite to 276 tests, including regression coverage for
   every connection-lifecycle and message-framing fix above.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to

@@ -59,6 +59,11 @@ public:
 
   // Initiate disconnect (auto_connect will bring it back).
   virtual void disconnect() = 0;
+  // Enable/disable the underlying client's auto-connect. Disabling also
+  // drops any live link. Used to back off when an appliance is refusing
+  // pairing (SMP REPEATED_ATTEMPTS): its lockout only clears once we stop
+  // redialing it every few seconds.
+  virtual void set_enabled(bool enabled) = 0;
 
   // Request the GATT MTU negotiation. Sub-Zero firmwares accept up to
   // 244 bytes; default 23 fragments responses heavily.

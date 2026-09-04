@@ -41,6 +41,11 @@ public:
       client_->disconnect();
   }
 
+  void set_enabled(bool enabled) override {
+    if (client_ != nullptr)
+      client_->set_enabled(enabled);
+  }
+
   void request_mtu() override {
     if (client_ == nullptr)
       return;

@@ -4,6 +4,7 @@
 #include "../subzero_protocol/log_sanitize.h"
 #include "../subzero_protocol/protocol.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -54,6 +55,8 @@ constexpr const char *kTimeoutSubmitPinPoll = "submit_pin_poll";
 constexpr const char *kTimeoutVerbFallbackRetry = "verb_fallback_retry";
 constexpr const char *kTimeoutSessionRefresh = "session_refresh";
 constexpr const char *kTimeoutSessionRefreshQuiet = "session_refresh_quiet";
+constexpr const char *kTimeoutEncryptionRetry = "encryption_retry";
+constexpr const char *kTimeoutPairingBackoff = "pairing_backoff";
 } // namespace
 
 // =============================================================================
@@ -103,6 +106,8 @@ void SubzeroHub::handle_disconnected() {
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
   write_fail_streak_ = 0;
+  enc_retry_count_ = 0;
+  enc_retry_pending_ = false;
   // Consume the flag unconditionally: if it were only cleared on the
   // handles-cached branch it could latch across a user-initiated reset in
   // the disconnect window and misclassify the *next* genuine failure as
@@ -123,23 +128,13 @@ void SubzeroHub::handle_disconnected() {
       HUB_LOGI("ble",
                "[%s] Disconnected (intentional, handles cached, d5=%d)",
                name_.c_str(), d5_handle_);
+    } else if (note_bond_failure_()) {
+      // Return early: the generic "Disconnected" below would immediately
+      // overwrite the bond-cleared instruction in the HA status sensor.
+      return;
     } else {
-      fast_retries_ += 1;
-      if (fast_retries_ >= kStaleBondsThreshold) {
-        HUB_LOGW("ble", "[%s] Stale bond (%d failures), clearing for re-pair",
-                 name_.c_str(), fast_retries_);
-        transport_->remove_bond();
-        clear_handles_();
-        phase_ = 0;
-        fast_retries_ = 0;
-        publish_status_("Bond cleared, re-pairing on next connect...");
-        // Return early: the generic "Disconnected" below would immediately
-        // overwrite the bond-cleared instruction in the HA status sensor.
-        return;
-      } else {
-        HUB_LOGI("ble", "[%s] Disconnected (handles cached, d5=%d, retries=%d)",
-                 name_.c_str(), d5_handle_, fast_retries_);
-      }
+      HUB_LOGI("ble", "[%s] Disconnected (handles cached, d5=%d, retries=%d)",
+               name_.c_str(), d5_handle_, fast_retries_);
     }
   } else {
     phase_ = 0;
@@ -238,6 +233,13 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
              name_.c_str(), auth_mode, (auth_mode & 0x01) ? 1 : 0,
              (auth_mode & 0x04) ? 1 : 0, (auth_mode & 0x08) ? 1 : 0);
     publish_pairing_error_("None");
+    pairing_backoff_ms_ = 0;
+    if (enc_retry_pending_) {
+      // The subscribe was waiting for exactly this; don't sit out the rest
+      // of the retry delay.
+      scheduler_->cancel_timeout(kTimeoutEncryptionRetry);
+      encryption_retry_();
+    }
     return;
   }
   const int smp = auth_fail_smp_code(fail_reason);
@@ -250,6 +252,105 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
   char status[80];
   std::snprintf(status, sizeof(status), "Pairing failed (%s)", reason);
   publish_status_(status);
+
+  // Whatever ladder was waiting on this bond is dead: stop it rather than
+  // letting its timers fire CCCD/unlock writes into an unencrypted link.
+  cancel_all_timeouts_();
+  post_bond_running_ = false;
+  subscribe_running_ = false;
+  fast_reconnect_running_ = false;
+  enc_retry_pending_ = false;
+
+  // A bonded appliance that now refuses us is the stale-bond case the
+  // three-strikes logic exists for. The failure can arrive before
+  // post_bond_initial_ has read the handles (the appliance's own Security
+  // Request on connect), so look them up now; if D5 is visible we were
+  // bonded before.
+  if (d5_handle_ == 0)
+    update_handles_from_db_();
+  bool bond_cleared = false;
+  if (d5_handle_ > 0 && phase_ >= 1)
+    bond_cleared = note_bond_failure_();
+
+  if (smp == 0x09) {
+    // SMP REPEATED_ATTEMPTS: the appliance is rate-limiting pairing. Its
+    // lockout only decays while we leave it alone, and auto_connect would
+    // otherwise redial within seconds and reset it.
+    start_pairing_backoff_();
+    return; // start_pairing_backoff_ drops the link itself
+  }
+  if (transport_->connected()) {
+    // Mark intentional so handle_disconnected() doesn't count this drop
+    // a second time on top of note_bond_failure_() above.
+    intentional_disconnect_ = true;
+    transport_->disconnect();
+  }
+  (void)bond_cleared;
+}
+
+bool SubzeroHub::note_bond_failure_() {
+  fast_retries_ += 1;
+  if (fast_retries_ < kStaleBondsThreshold)
+    return false;
+  HUB_LOGW("ble", "[%s] Stale bond (%d failures), clearing for re-pair",
+           name_.c_str(), fast_retries_);
+  transport_->remove_bond();
+  clear_handles_();
+  phase_ = 0;
+  fast_retries_ = 0;
+  publish_status_("Bond cleared, re-pairing on next connect...");
+  return true;
+}
+
+void SubzeroHub::encryption_retry_() {
+  enc_retry_pending_ = false;
+  if (transport_ == nullptr || !transport_->connected() || d5_handle_ == 0)
+    return;
+  HUB_LOGI("ble", "[%s] Retrying subscribe (attempt %d/%d)", name_.c_str(),
+           enc_retry_count_, kMaxEncryptionRetries);
+  // Harmless if already encrypted; nudges Bluedroid if the earlier request
+  // was queued behind another security procedure.
+  transport_->request_encryption();
+  start_subscribe_();
+}
+
+void SubzeroHub::start_pairing_backoff_() {
+  if (transport_ == nullptr || scheduler_ == nullptr)
+    return;
+  pairing_backoff_ms_ = pairing_backoff_ms_ == 0
+                            ? kPairingBackoffInitialMs
+                            : std::min(pairing_backoff_ms_ * 2,
+                                       kPairingBackoffMaxMs);
+  const unsigned secs = static_cast<unsigned>(pairing_backoff_ms_ / 1000);
+  HUB_LOGW("ble",
+           "[%s] Appliance is rate-limiting pairing (SMP REPEATED_ATTEMPTS); "
+           "holding off reconnects for %u s",
+           name_.c_str(), secs);
+  char status[80];
+  std::snprintf(status, sizeof(status),
+                "Appliance refusing pairing, retrying in %u s", secs);
+  publish_status_(status);
+  // Disabling drops the link; that disconnect is ours.
+  if (transport_->connected())
+    intentional_disconnect_ = true;
+  transport_->set_enabled(false);
+  scheduler_->set_timeout(kTimeoutPairingBackoff, pairing_backoff_ms_,
+                          [this]() {
+                            HUB_LOGI("ble", "[%s] Pairing back-off over, re-enabling client",
+                                     name_.c_str());
+                            publish_progress_("Retrying pairing...");
+                            transport_->set_enabled(true);
+                          });
+}
+
+void SubzeroHub::cancel_pairing_backoff_() {
+  if (scheduler_ == nullptr || transport_ == nullptr)
+    return;
+  scheduler_->cancel_timeout(kTimeoutPairingBackoff);
+  if (pairing_backoff_ms_ != 0) {
+    pairing_backoff_ms_ = 0;
+    transport_->set_enabled(true);
+  }
 }
 
 std::uint32_t SubzeroHub::handle_passkey_request() {
@@ -267,12 +368,49 @@ std::uint32_t SubzeroHub::handle_passkey_request() {
   return static_cast<std::uint32_t>(std::atoi(stored_pin_.c_str()));
 }
 
-void SubzeroHub::handle_write_failed(std::uint16_t handle) {
-  if (transport_ == nullptr)
+void SubzeroHub::handle_write_failed(std::uint16_t handle, int gatt_status) {
+  if (transport_ == nullptr || scheduler_ == nullptr)
     return;
+  if (gatt_status_is_security(gatt_status)) {
+    // The appliance rejected the write because the link is not encrypted
+    // (yet). That is the normal state for the first second or two after
+    // request_encryption(): the ladder proceeds on a fixed timer because
+    // Bluedroid raises no application event when a bonded link simply
+    // re-encrypts with its stored key. A Wolf range was observed taking
+    // longer than the timer, and the old code counted these toward the
+    // stale-handle streak and tore the link down mid-handshake. Retry the
+    // subscribe instead, a bounded number of times.
+    if (enc_retry_pending_) {
+      return; // one retry already scheduled; the CCCD/unlock writes all fail together
+    }
+    if (enc_retry_count_ >= kMaxEncryptionRetries) {
+      HUB_LOGW("ble",
+               "[%s] Link still not encrypted after %d subscribe retries "
+               "(status 0x%02X), reconnecting",
+               name_.c_str(), enc_retry_count_, gatt_status);
+      publish_status_("Encryption not completing, reconnecting...");
+      // Not intentional: with handles cached this counts as a stale-bond
+      // strike in handle_disconnected(), so a bond that no longer works
+      // gets cleared after kStaleBondsThreshold of these.
+      transport_->disconnect();
+      return;
+    }
+    enc_retry_count_ += 1;
+    enc_retry_pending_ = true;
+    HUB_LOGI("ble",
+             "[%s] Write to handle %d rejected, link not yet encrypted "
+             "(status 0x%02X); retrying subscribe in %u ms (attempt %d/%d)",
+             name_.c_str(), handle, gatt_status,
+             static_cast<unsigned>(kEncryptionRetryDelayMs), enc_retry_count_,
+             kMaxEncryptionRetries);
+    scheduler_->set_timeout(kTimeoutEncryptionRetry, kEncryptionRetryDelayMs,
+                            [this]() { encryption_retry_(); });
+    return;
+  }
   write_fail_streak_ += 1;
-  HUB_LOGW("ble", "[%s] Async GATT write failure at handle %d (streak=%d)",
-           name_.c_str(), handle, write_fail_streak_);
+  HUB_LOGW("ble",
+           "[%s] Async GATT write failure at handle %d (status 0x%02X, streak=%d)",
+           name_.c_str(), handle, gatt_status, write_fail_streak_);
   if (write_fail_streak_ < kWriteFailStreakThreshold)
     return;
   // Persistent ATT-level failures on a live connection mean the cached
@@ -364,6 +502,8 @@ void SubzeroHub::handle_complete_message_(std::string &msg) {
   }
   fast_retries_ = 0;
   write_fail_streak_ = 0;
+  enc_retry_count_ = 0;
+  pairing_backoff_ms_ = 0;
   // is_poll is set by the parser only when the message was a status:0 poll
   // response (extract_data), which is exactly what the old full-buffer
   // status scan detected — minus the rescan.
@@ -844,7 +984,10 @@ void SubzeroHub::press_connect() {
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
   write_fail_streak_ = 0;
+  enc_retry_count_ = 0;
+  enc_retry_pending_ = false;
   d6_missing_streak_ = 0;
+  cancel_pairing_backoff_();
 }
 
 void SubzeroHub::press_start_pairing() {
@@ -934,7 +1077,10 @@ void SubzeroHub::press_reset_pairing() {
   subscribe_running_ = false;
   fast_reconnect_running_ = false;
   write_fail_streak_ = 0;
+  enc_retry_count_ = 0;
+  enc_retry_pending_ = false;
   d6_missing_streak_ = 0;
+  cancel_pairing_backoff_();
   transport_->cache_clean();
   transport_->remove_bond();
   HUB_LOGW("ble", "[%s] Bond removed, GATT cache cleared, all state reset",
@@ -1001,6 +1147,10 @@ void SubzeroHub::cancel_all_timeouts_() {
   scheduler_->cancel_timeout(kTimeoutSubmitPinPoll);
   scheduler_->cancel_timeout(kTimeoutVerbFallbackRetry);
   scheduler_->cancel_timeout(kTimeoutSessionRefresh);
+  scheduler_->cancel_timeout(kTimeoutEncryptionRetry);
+  // Deliberately not cancelled: kTimeoutPairingBackoff (must outlive the
+  // disconnect it causes, or the client stays disabled forever) and
+  // kTimeoutSessionRefreshQuiet (see hub.h).
 }
 
 void SubzeroHub::clear_handles_() {

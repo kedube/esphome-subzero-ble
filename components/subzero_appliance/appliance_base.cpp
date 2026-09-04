@@ -33,6 +33,12 @@ void ApplianceBase::setup() {
         [ts](const std::string &text) { ts->publish_state(text); });
   }
 
+  if (pairing_error_ts_ != nullptr) {
+    auto *ts = pairing_error_ts_;
+    h->set_pairing_error_callback(
+        [ts](const std::string &text) { ts->publish_state(text); });
+  }
+
   if (pin_input_ != nullptr) {
     auto *pi = pin_input_;
     h->set_pin_input_callback(

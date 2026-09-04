@@ -158,6 +158,16 @@ public:
   void set_pin_input_callback(std::function<void(const std::string &)> cb) {
     pin_input_cb_ = std::move(cb);
   }
+  // Last-pairing-error callback — connected to the "Last Pairing Error"
+  // diagnostic text sensor. Unlike Status, which is overwritten by the
+  // reconnect chatter seconds after a bond failure, this holds the decoded
+  // SMP reason until the next successful bond clears it to "None". Only
+  // fires when the value changes, so a wrong-PIN retry loop does not
+  // republish the same reason every few seconds.
+  void set_pairing_error_callback(
+      std::function<void(const std::string &)> cb) {
+    pairing_error_cb_ = std::move(cb);
+  }
   // Subscribe-stage hook — fires once at the top of the subscribe step
   // (after handles are known, before register_for_notify + CCCD writes).
   // Used by the YAML to inject discovered handles into ESPHome's
@@ -271,6 +281,8 @@ private:
   // step-by-step detail stays available in the ESPHome log - it just
   // doesn't turn into a Home Assistant logbook entry every 18 minutes.
   void publish_progress_(const std::string &text);
+  // Publishes to the Last Pairing Error entity, de-duplicated.
+  void publish_pairing_error_(const std::string &text);
   // Cancels every scheduler timeout this hub can arm. Called from the
   // three teardown paths (handle_disconnected / press_connect /
   // press_reset_pairing) so the timeout-name list lives in exactly one
@@ -297,6 +309,7 @@ private:
   std::string name_;
   std::function<void(const std::string &)> status_cb_;
   std::function<void(const std::string &)> pin_input_cb_;
+  std::function<void(const std::string &)> pairing_error_cb_;
   std::function<void()> subscribe_cb_;
 
   // ---- state (1:1 with the previous YAML globals) ----
@@ -363,6 +376,8 @@ private:
   // Last value handed to status_cb_, used to drop duplicate publishes.
   // (last_status_ above is the protocol status code, unrelated.)
   std::string last_published_status_;
+  // Last value handed to pairing_error_cb_ (see publish_pairing_error_).
+  std::string last_pairing_error_;
 
   // True from the moment a scheduled session refresh starts until it
   // finishes (or errors, or the watchdog fires). While set, progress

@@ -204,13 +204,17 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
              "[%s] SMP bond OK (auth_mode=0x%02X: bond=%d mitm=%d sc=%d)",
              name_.c_str(), auth_mode, (auth_mode & 0x01) ? 1 : 0,
              (auth_mode & 0x04) ? 1 : 0, (auth_mode & 0x08) ? 1 : 0);
+    publish_pairing_error_("None");
     return;
   }
   HUB_LOGE("ble", "[%s] SMP bond FAILED reason=0x%02X (%s)", name_.c_str(),
            fail_reason, auth_fail_reason_str(fail_reason));
+  char reason[64];
+  std::snprintf(reason, sizeof(reason), "0x%02X %s", fail_reason,
+                auth_fail_reason_str(fail_reason));
+  publish_pairing_error_(reason);
   char status[80];
-  std::snprintf(status, sizeof(status), "Pairing failed (0x%02X %s)",
-                fail_reason, auth_fail_reason_str(fail_reason));
+  std::snprintf(status, sizeof(status), "Pairing failed (%s)", reason);
   publish_status_(status);
 }
 
@@ -937,6 +941,14 @@ void SubzeroHub::publish_progress_(const std::string &text) {
   if (session_refresh_quiet_)
     return;
   publish_status_(text);
+}
+
+void SubzeroHub::publish_pairing_error_(const std::string &text) {
+  if (text == last_pairing_error_)
+    return;
+  last_pairing_error_ = text;
+  if (pairing_error_cb_)
+    pairing_error_cb_(text);
 }
 
 void SubzeroHub::cancel_all_timeouts_() {

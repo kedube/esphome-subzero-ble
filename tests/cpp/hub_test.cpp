@@ -72,6 +72,8 @@ protected:
         [this](const std::string &s) { status_log_.push_back(s); });
     hub_.set_pin_input_callback(
         [this](const std::string &p) { pin_input_log_.push_back(p); });
+    hub_.set_pairing_error_callback(
+        [this](const std::string &e) { pairing_error_log_.push_back(e); });
     transport_.set_connected(true);
   }
 
@@ -118,6 +120,7 @@ protected:
   TestHub hub_;
   std::vector<std::string> status_log_;
   std::vector<std::string> pin_input_log_;
+  std::vector<std::string> pairing_error_log_;
 };
 
 } // namespace
@@ -478,6 +481,40 @@ TEST_F(HubFixture, AuthComplete_FailurePublishesDecodedReason) {
 TEST_F(HubFixture, AuthComplete_UnknownReasonStillReportsCode) {
   hub_.handle_auth_complete(false, 0x7F, 0);
   EXPECT_EQ(status_log_.back(), "Pairing failed (0x7F UNKNOWN)");
+}
+
+// Status gets overwritten by reconnect chatter seconds after a bond
+// failure; the Last Pairing Error entity is the one that holds the reason.
+TEST_F(HubFixture, AuthComplete_FailureSetsLastPairingError) {
+  hub_.handle_auth_complete(false, 0x04, 0);
+  ASSERT_EQ(pairing_error_log_.size(), 1u);
+  EXPECT_EQ(pairing_error_log_.back(), "0x04 CONFIRM_VALUE_FAILED (wrong PIN)");
+}
+
+// A wrong PIN makes auto_connect redial every few seconds and fail the
+// same way each time; that must not republish the same reason each cycle.
+TEST_F(HubFixture, AuthComplete_RepeatedSameFailureDoesNotRepublish) {
+  for (int i = 0; i < 4; ++i)
+    hub_.handle_auth_complete(false, 0x04, 0);
+  EXPECT_EQ(pairing_error_log_.size(), 1u);
+
+  // A different reason is news.
+  hub_.handle_auth_complete(false, 0x03, 0);
+  ASSERT_EQ(pairing_error_log_.size(), 2u);
+  EXPECT_TRUE(pairing_error_log_.back().find("AUTH_REQ_UNMET") !=
+              std::string::npos);
+}
+
+// The next good bond clears the entity, and only once.
+TEST_F(HubFixture, AuthComplete_SuccessClearsLastPairingError) {
+  hub_.handle_auth_complete(false, 0x04, 0);
+  hub_.handle_auth_complete(true, 0, 0x0D);
+  hub_.handle_auth_complete(true, 0, 0x0D);
+  ASSERT_EQ(pairing_error_log_.size(), 2u);
+  EXPECT_EQ(pairing_error_log_.back(), "None");
+  // Success still publishes no Status change.
+  EXPECT_TRUE(status_log_.size() == 1u &&
+              status_log_.front().rfind("Pairing failed", 0) == 0);
 }
 
 // =============================================================================

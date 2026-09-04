@@ -300,7 +300,7 @@ TIP: Sub-Zero appliance BLE MAC addresses typically begin with `00:06:80`. You c
 | Expected. ESPHome's BLE sensor component looks for D5 before encryption exposes it. The code injects the correct handle later.
 
 | *Status reads "Pairing failed (0x04 CONFIRM_VALUE_FAILED (wrong PIN))" or another `Pairing failed (0x..)` code*
-| The BLE bond itself was rejected by the appliance, before any data channel was reached. `0x04` means the PIN you entered does not match the one on the appliance display - re-check it (see <<pairing>>). `0x03 AUTH_REQ_UNMET` means the appliance and ESP32 disagree on pairing requirements (IO capability / MITM); keep `io_capability: keyboard_only` in your `esp32_ble:` block. Other codes are the raw SMP Pairing Failed reason, also written to the ESPHome log at `ERROR`.
+| The BLE bond itself was rejected by the appliance, before any data channel was reached. Status moves on to `Disconnected` and the reconnect loop within seconds; the *Last Pairing Error* diagnostic sensor holds the reason until the next successful bond. `0x04` means the PIN you entered does not match the one on the appliance display - re-check it (see <<pairing>>). `0x03 AUTH_REQ_UNMET` means the appliance and ESP32 disagree on pairing requirements (IO capability / MITM); keep `io_capability: keyboard_only` in your `esp32_ble:` block. Other codes are the raw SMP Pairing Failed reason, also written to the ESPHome log at `ERROR`.
 
 | *Passkey request but no PIN*
 | Enter your PIN via the text input in Home Assistant, then press "Submit PIN & Unlock."
@@ -572,6 +572,7 @@ These diagnostic text sensors are exposed under HA's Diagnostic section for ever
 | *RTApp Version* | Realtime application version
 | *Appliance Board Version* | Raw composite string of sub-board versions (e.g. `main: 10.11.6877; mcb_ccm_lv: 9.4.4034; uim_typeA: 11.0.13`). Sub-fields vary by appliance - parse in a HA template if you need individual values.
 | *Build Date* | Firmware build timestamp
+| *Last Pairing Error* | Decoded reason from the most recent failed BLE bond (e.g. `0x04 CONFIRM_VALUE_FAILED (wrong PIN)`). Holds that value until the next successful bond clears it to `None`, so it stays readable after *Status* has moved on to the reconnect loop. Unknown until the first bond attempt.
 |===
 
 [[status-entity-and-logbook-noise]]

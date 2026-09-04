@@ -54,6 +54,9 @@ public:
   void set_status_text_sensor(esphome::text_sensor::TextSensor *s) {
     status_ts_ = s;
   }
+  void set_pairing_error_text_sensor(esphome::text_sensor::TextSensor *s) {
+    pairing_error_ts_ = s;
+  }
   void set_pin_input(esphome::text::Text *t) { pin_input_ = t; }
   // Debug Mode switch — held so press_log_debug_info() can flip the HA
   // UI state when the user clicks the "Log Debug Info" button
@@ -191,6 +194,7 @@ protected:
 
   // Entity refs (set from Python codegen)
   esphome::text_sensor::TextSensor *status_ts_ = nullptr;
+  esphome::text_sensor::TextSensor *pairing_error_ts_ = nullptr;
   esphome::text::Text *pin_input_ = nullptr;
   esphome::switch_::Switch *debug_switch_ = nullptr;
 

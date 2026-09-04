@@ -45,6 +45,10 @@ after a release — the workflow expects it.
   and one that completed but exposed no data channel produced identical logs
   and a silent reconnect loop. Adapted from upstream
   JonGilmore/esphome-subzero-ble branch `diag/fw85-handshake`.
+- Add a **Last Pairing Error** diagnostic text sensor per appliance. Status
+  is overwritten by the reconnect loop seconds after a bond failure; this
+  entity holds the decoded reason until the next successful bond clears it to
+  `None`, and only republishes when the reason changes.
 
 ### Fixed
 
@@ -137,7 +141,7 @@ after a release — the workflow expects it.
   `sensor.<device>_uptime` and let it be recreated, and update any template or
   automation that parsed the old string. Firmware-truncated values
   (`627:09:3`, `1000:00:`) are handled; a malformed value publishes nothing.
-- Expand the host test suite to 263 tests, including regression coverage for
+- Expand the host test suite to 266 tests, including regression coverage for
   every connection-lifecycle and message-framing fix above.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to

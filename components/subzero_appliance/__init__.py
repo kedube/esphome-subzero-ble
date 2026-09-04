@@ -1647,6 +1647,22 @@ async def to_code(config):
     status_var = await text_sensor.new_text_sensor(status_cfg)
     cg.add(var.set_status_text_sensor(status_var))
 
+    # ---- Last Pairing Error text sensor ----
+    # Holds the decoded SMP reason from the most recent failed bond until
+    # the next successful bond clears it to "None". Status shows the same
+    # failure, but is overwritten by reconnect chatter within seconds.
+    pairing_error_cfg = _validate_text_sensor(
+        {
+            CONF_ID: _entity_id(parent_id, "pairing_error", text_sensor.TextSensor),
+            CONF_NAME: "Last Pairing Error",
+            CONF_DEVICE_ID: _subdevice_id(parent_id),
+            CONF_ICON: "mdi:lock-alert-outline",
+            CONF_ENTITY_CATEGORY: ENTITY_CATEGORY_DIAGNOSTIC,
+        }
+    )
+    pairing_error_var = await text_sensor.new_text_sensor(pairing_error_cfg)
+    cg.add(var.set_pairing_error_text_sensor(pairing_error_var))
+
     # ---- Common binary sensors ----
     for suffix, name_suffix, setter, kwargs in COMMON_BINARY_SENSORS:
         cfg = _build_binary_sensor_config(parent_id, suffix, name_suffix, kwargs)

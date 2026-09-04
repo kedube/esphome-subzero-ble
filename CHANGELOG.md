@@ -19,6 +19,14 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+### Changed
+
+- Releases are now cut only by running the Release workflow manually. A green
+  CI run on `main` no longer produces a patch release on its own, and the
+  post-release version bump is committed straight to `main` instead of being
+  opened as a pull request from a `chore/bump-refs-*` branch, which this
+  repository's Actions settings never allowed to be created.
+
 ## [3.8.4] - 2026-09-04
 
 ### Security

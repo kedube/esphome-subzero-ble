@@ -27,36 +27,29 @@ on:
         required: false
         default: false
         type: boolean
-  workflow_run:
-    workflows: [CI]
-    branches: [main]
-    types: [completed]
+  # Manual only. Releases used to be cut automatically after every green CI
+  # run on main, which meant a README typo produced a new patch version.
+  # Run this from Actions -> Release -> Run workflow when there is
+  # something worth shipping.
 
 permissions:
   actions: read
   contents: write
-  pull-requests: write
 
 jobs:
   release:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       !contains(github.event.workflow_run.head_commit.message, 'chore: bump version refs') &&
-       !contains(github.event.workflow_run.head_commit.message, 'chore/bump-refs'))
     runs-on: ubuntu-latest
     env:
-      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-      RELEASE_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'patch' }}
-      RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
-      RELEASE_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
-      ALLOW_FIRST_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_first_release || false }}
+      RELEASE_SHA: ${{ github.sha }}
+      RELEASE_BUMP: ${{ inputs.bump }}
+      RELEASE_DRY_RUN: ${{ inputs.dry_run }}
+      RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+      ALLOW_FIRST_RELEASE: ${{ inputs.allow_first_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       # ------------------------------------------------------------------
       # Gate: never tag a commit whose CI didn't pass.
@@ -285,8 +278,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --quiet && exit 0
-          # This message is what the release job's `if:` gate matches on, so
-          # the CI run this push triggers does not cut another release.
+          # The push below triggers CI on main, which is fine: releases are
+          # manual, so nothing recurses from it.
           git commit -m "chore: bump version refs to ${NEW} and roll CHANGELOG"
 
           # Push straight to main. This repository's Actions settings do not

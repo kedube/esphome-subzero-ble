@@ -37,6 +37,19 @@ after a release — the workflow expects it.
 
 ### Fixed
 
+- Stop the Status entity from spamming the Home Assistant logbook. HA writes
+  a logbook row for every distinct value a text sensor publishes, and a
+  healthy appliance produced roughly a thousand a day: "PIN confirmed" was
+  re-announced on every poll response, and the scheduled ~18-minute session
+  refresh narrated its own disconnect/reconnect in five steps. PIN
+  confirmation now announces only the edge, the session refresh is silent
+  while it succeeds (a 90 s watchdog surfaces "Reconnecting..." if it stalls,
+  and an unexpected drop always reports), and identical consecutive statuses
+  are no longer republished. Every suppressed step still logs at INFO.
+  Backported from upstream JonGilmore/esphome-subzero-ble PR #117.
+- Republish the dishwasher Wash Cycle End Time only when the appliance's
+  estimate moves by 5 minutes or more. It re-estimates on every poll and
+  wobbles a minute either way around a target that has not moved.
 - Recover from a truncated GATT snapshot instead of hanging forever. When
   service discovery returned the control characteristic but not the data
   characteristic, the connection stalled at "Auto-unlocking…" with no polling,
@@ -104,7 +117,16 @@ after a release — the workflow expects it.
 
 ### Changed
 
-- Expand the host test suite to 237 tests, including regression coverage for
+- **Breaking:** Appliance Uptime is now a numeric duration in seconds
+  (`device_class: duration`, `state_class: total_increasing`) instead of the
+  appliance's raw `H:MM:SS` string. The string advanced on every poll and, as
+  a text sensor, produced a logbook row each time; a numeric sensor with a
+  unit is excluded from the logbook and is graphable. The entity ID is
+  unchanged. If Home Assistant complains about the unit change, delete
+  `sensor.<device>_uptime` and let it be recreated, and update any template or
+  automation that parsed the old string. Firmware-truncated values
+  (`627:09:3`, `1000:00:`) are handled; a malformed value publishes nothing.
+- Expand the host test suite to 260 tests, including regression coverage for
   every connection-lifecycle and message-framing fix above.
 - Restrict continuous integration to read-only repository permissions, fail the
   test job if test discovery ever breaks, and pin all GitHub Actions to

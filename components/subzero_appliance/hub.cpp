@@ -52,6 +52,7 @@ constexpr const char *kTimeoutFastReconnect = "fast_reconnect";
 constexpr const char *kTimeoutSubmitPinPoll = "submit_pin_poll";
 constexpr const char *kTimeoutVerbFallbackRetry = "verb_fallback_retry";
 constexpr const char *kTimeoutSessionRefresh = "session_refresh";
+constexpr const char *kTimeoutSessionRefreshQuiet = "session_refresh_quiet";
 } // namespace
 
 // =============================================================================
@@ -68,7 +69,7 @@ void SubzeroHub::handle_connected() {
   if (d5_handle_ > 0 && phase_ >= 1) {
     HUB_LOGI("ble", "[%s] Reconnected (fast path, d5=%d, retries=%d)",
              name_.c_str(), d5_handle_, fast_retries_);
-    publish_status_("Reconnected, encrypting...");
+    publish_progress_("Reconnected, encrypting...");
     start_fast_reconnect_();
     return;
   }
@@ -108,6 +109,11 @@ void SubzeroHub::handle_disconnected() {
   const bool intentional = intentional_disconnect_;
   intentional_disconnect_ = false;
 
+  // Anything other than the refresh's own disconnect is real news: stop
+  // muting so the drop (and whatever follows) reaches the user.
+  if (!intentional)
+    session_refresh_quiet_ = false;
+
   if (d5_handle_ > 0 && phase_ >= 1) {
     if (intentional) {
       // We initiated this (session refresh, user Disconnect press, debug
@@ -145,7 +151,7 @@ void SubzeroHub::handle_disconnected() {
       return;
     }
   }
-  publish_status_("Disconnected");
+  publish_progress_("Disconnected");
 }
 
 std::uint32_t SubzeroHub::handle_passkey_request() {
@@ -302,9 +308,20 @@ bool SubzeroHub::handle_lacking_properties_() {
 }
 
 void SubzeroHub::on_pin_confirmed_(const std::string &pin) {
+  // Subclasses call this for every parsed message carrying a `pin` field,
+  // which on a healthy link is every poll response — not just the moment
+  // the channel actually unlocks. Only the false->true edge (or a PIN
+  // that genuinely changed) is news; announcing the steady state on every
+  // poll spammed the Home Assistant logbook with a duplicate row roughly
+  // every 25 seconds. The same edge gates the unlock_cmd_ cache: clearing
+  // it on every poll defeated the point of caching it.
+  const bool newly_confirmed = !pin_confirmed_ || pin != stored_pin_;
+  if (pin != stored_pin_)
+    unlock_cmd_.clear(); // rebuilt lazily by write_unlock_channel_
   stored_pin_ = pin;
-  unlock_cmd_.clear(); // rebuilt lazily by write_unlock_channel_
   pin_confirmed_ = true;
+  if (!newly_confirmed)
+    return;
   if (pin_input_cb_)
     pin_input_cb_(pin);
   // Value deliberately omitted — see handle_passkey_request.
@@ -600,7 +617,7 @@ void SubzeroHub::subscribe_unlock_() {
     write_unlock_channel_(d6_handle_);
     HUB_LOGI("ble", "[%s] Auto-unlock D6", name_.c_str());
   }
-  publish_status_("Auto-unlocking...");
+  publish_progress_("Auto-unlocking...");
 
   scheduler_->set_timeout(kTimeoutSubscribeGet, kSubscribeInitialGetDelayMs,
                           [this]() { subscribe_initial_get_(); });
@@ -673,11 +690,28 @@ void SubzeroHub::disconnect_for_session_refresh_() {
       "[%s] Scheduled session refresh (%u min), reconnecting via fast path",
       name_.c_str(), static_cast<unsigned>(kSessionRefreshIntervalMs / 60000));
   json_buf_.clear();
-  publish_status_("Refreshing session...");
+  // Mute progress chatter for the duration of the bounce. The user asked
+  // for none of this; they just want Status to keep reading "Connected
+  // and polling." across a refresh that succeeds.
+  session_refresh_quiet_ = true;
+  scheduler_->set_timeout(kTimeoutSessionRefreshQuiet,
+                          kSessionRefreshQuietMaxMs,
+                          [this]() { session_refresh_quiet_expired_(); });
+  publish_progress_("Refreshing session...");
   // Tag the next disconnect callback so handle_disconnected skips
   // fast_retries_ accounting — see intentional_disconnect_ comment.
   intentional_disconnect_ = true;
   transport_->disconnect();
+}
+
+void SubzeroHub::session_refresh_quiet_expired_() {
+  if (!session_refresh_quiet_)
+    return; // refresh already completed or errored out; nothing to say
+  session_refresh_quiet_ = false;
+  HUB_LOGW("ble", "[%s] Session refresh still incomplete after %u s",
+           name_.c_str(),
+           static_cast<unsigned>(kSessionRefreshQuietMaxMs / 1000));
+  publish_status_("Reconnecting...");
 }
 
 // =============================================================================
@@ -830,8 +864,19 @@ void SubzeroHub::set_stored_pin(const std::string &pin) {
 }
 
 void SubzeroHub::publish_status_(const std::string &text) {
+  // A real state won the race — stop muting progress chatter.
+  session_refresh_quiet_ = false;
+  if (text == last_published_status_)
+    return;
+  last_published_status_ = text;
   if (status_cb_)
     status_cb_(text);
+}
+
+void SubzeroHub::publish_progress_(const std::string &text) {
+  if (session_refresh_quiet_)
+    return;
+  publish_status_(text);
 }
 
 void SubzeroHub::cancel_all_timeouts_() {

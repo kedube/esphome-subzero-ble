@@ -132,6 +132,12 @@ public:
   // Public so tests can advance the fake scheduler to exactly the refresh
   // deadline
   static constexpr std::uint32_t kSessionRefreshIntervalMs = 18 * 60 * 1000;
+  // Upper bound on how long progress chatter stays muted for a session
+  // refresh. A healthy refresh re-polls within a few seconds; if one
+  // takes longer than this, something is wrong and the user should see
+  // it rather than a Status frozen at "Connected and polling."
+  // Public for the same reason as kSessionRefreshIntervalMs.
+  static constexpr std::uint32_t kSessionRefreshQuietMaxMs = 90 * 1000;
   // Status text callback — connected to ${prefix}_debug.publish_state.
   void set_status_callback(std::function<void(const std::string &)> cb) {
     status_cb_ = std::move(cb);
@@ -241,13 +247,29 @@ private:
 
   // Scheduled session refresh - fires once per session ~18 min after unlock
   void disconnect_for_session_refresh_();
+  // Watchdog: un-mutes progress reporting if a session refresh never
+  // completes, so the Status entity can't get stuck on a stale value.
+  void session_refresh_quiet_expired_();
 
   // ---- helpers ----
+  // Publishes a real, user-meaningful state. De-duplicated against the
+  // last published value, and always ends any session-refresh quiet
+  // window (an error or terminal state must never stay hidden).
   void publish_status_(const std::string &text);
+  // Publishes intermediate connect/reconnect chatter. Identical to
+  // publish_status_ except it is swallowed while a scheduled session
+  // refresh is in flight. Every call site still logs at INFO, so the
+  // step-by-step detail stays available in the ESPHome log - it just
+  // doesn't turn into a Home Assistant logbook entry every 18 minutes.
+  void publish_progress_(const std::string &text);
   // Cancels every scheduler timeout this hub can arm. Called from the
   // three teardown paths (handle_disconnected / press_connect /
   // press_reset_pairing) so the timeout-name list lives in exactly one
   // place — adding a new timeout means updating only this method.
+  // Deliberate exception: the session-refresh quiet watchdog is left
+  // armed, because the refresh's own disconnect runs through
+  // handle_disconnected() and the watchdog must outlive it. Its callback
+  // is a no-op once session_refresh_quiet_ has been cleared.
   void cancel_all_timeouts_();
   void clear_handles_();
   void process_message_complete_();
@@ -328,6 +350,17 @@ private:
   // this, two failed reconnects on top of a session refresh would
   // wrongly wipe the bond.
   bool intentional_disconnect_ = false;
+
+  // Last value handed to status_cb_, used to drop duplicate publishes.
+  // (last_status_ above is the protocol status code, unrelated.)
+  std::string last_published_status_;
+
+  // True from the moment a scheduled session refresh starts until it
+  // finishes (or errors, or the watchdog fires). While set, progress
+  // chatter is suppressed: the refresh is an internal implementation
+  // detail, and narrating it wrote ~5 Home Assistant logbook rows every
+  // 18 minutes. See publish_progress_().
+  bool session_refresh_quiet_ = false;
 
   // D6 message buffer (D5 is heartbeat-only post-PR-#72).
   esphome::subzero_protocol::MessageBuffer json_buf_;

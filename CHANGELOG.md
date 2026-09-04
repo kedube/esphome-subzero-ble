@@ -21,11 +21,17 @@ after a release — the workflow expects it.
 
 ### Changed
 
-- Releases are now cut only by running the Release workflow manually. A green
-  CI run on `main` no longer produces a patch release on its own, and the
-  post-release version bump is committed straight to `main` instead of being
-  opened as a pull request from a `chore/bump-refs-*` branch, which this
-  repository's Actions settings never allowed to be created.
+- Derive the release bump from commit messages. After a green CI run on
+  `main`, a `feat:` commit since the last tag produces a minor release, a
+  `fix:`/`perf:` a patch, a `!`/`BREAKING CHANGE` a major, and pushes made up
+  only of `docs:`/`ci:`/`chore:`-style commits release nothing. Previously
+  every push cut a patch release, README typos included. A due release with
+  an empty Unreleased section is skipped with a warning instead of shipping
+  without notes.
+- Commit the post-release version bump straight to `main` instead of opening
+  a pull request from a `chore/bump-refs-*` branch, which this repository's
+  Actions settings never allowed to be created and which left an orphan
+  branch behind on every release.
 
 ## [3.8.4] - 2026-09-04
 

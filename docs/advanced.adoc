@@ -220,7 +220,20 @@ To add a fixture for a new appliance variant: turn on *Debug Mode*, concatenate 
 
 == Cutting a Release
 
-Releases are cut deliberately, by running the *Release* workflow (Actions -> Release -> Run workflow) and choosing a `patch`, `minor`, or `major` bump; a prerelease, a dry run, and a first-release opt-in are also available there. Pushing to `main` never releases on its own. The workflow never tags a commit that CI hasn't blessed: the first step looks up the CI run for the exact commit being released and aborts if that run failed, is missing, or never completed. An in-progress run is waited out for up to 30 minutes.
+Releases are driven by the commit messages. After every green CI run on `main`, the *Release* workflow's `plan` job classifies the commits since the last `vX.Y.Z` tag using conventional-commit prefixes and picks the bump:
+
+[cols="1,1,2"]
+|===
+| Commit | Bump | Notes
+
+| `type!: ...` or a `BREAKING CHANGE` footer | major |
+| `feat: ...` | minor |
+| `fix: ...`, `perf: ...`, `revert: ...` | patch |
+| `docs:`, `ci:`, `chore:`, `test:`, `style:`, `build:`, `refactor:` | none | A push containing only these releases nothing.
+| no recognised prefix | patch | This is firmware; an unlabelled code change ships rather than sitting unreleased because of a commit-message slip.
+|===
+
+The highest level wins across the whole range, and merge commits are ignored. If the commits warrant a release but the CHANGELOG's Unreleased section is empty, the run is skipped with a warning in the summary rather than failing: add entries and push again. You can still run the workflow by hand (Actions -> Release -> Run workflow) to force a specific bump, a prerelease, a dry run, or a first-release opt-in; leave the bump on `auto` there to get the same classification. Either way, the workflow never tags a commit that CI hasn't blessed: it looks up the CI run for the exact commit being released and aborts if that run failed, is missing, or never completed. An in-progress run is waited out for up to 30 minutes.
 
 === Writing the release notes
 

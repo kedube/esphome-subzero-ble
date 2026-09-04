@@ -177,7 +177,7 @@ subzero_appliance:
 
 NOTE: `esp32_ble: max_connections: 5` supports up to 5 concurrent appliances on one ESP32. Bump it (and see link:docs/advanced.adoc#ble-stack-tuning[BLE Stack Tuning] for additional `sdkconfig_options`) if you need more.
 
-TIP: The multi-appliance `subzero.yaml` in the repo root tracks `main`; keep appliance setup in `settings.yaml` and credentials in `secrets.yaml`. Releases are cut manually from the *Release* workflow (Actions -> Release -> Run workflow); each release commits a follow-up to `main` that stamps the `sw_version` substitution in `settings-example.yaml` to the new release number and rolls the CHANGELOG. If you prefer fully reproducible builds, change `ref: main` to a release tag such as `ref: v3.8.4`.
+TIP: The multi-appliance `subzero.yaml` in the repo root tracks `main`; keep appliance setup in `settings.yaml` and credentials in `secrets.yaml`. Releases are cut automatically from the commit messages: after a green CI run on `main`, a `feat:` commit since the last tag produces a minor release, a `fix:` or `perf:` a patch, a `!`/`BREAKING CHANGE` a major, and `docs:`/`ci:`/`chore:`-only pushes release nothing (see link:docs/advanced.adoc#_cutting_a_release[Cutting a Release]). Each release commits a follow-up to `main` that stamps the `sw_version` substitution in `settings-example.yaml` to the new release number and rolls the CHANGELOG. If you prefer fully reproducible builds, change `ref: main` to a release tag such as `ref: v3.8.4`.
 
 ==== Fridge-Only Options
 

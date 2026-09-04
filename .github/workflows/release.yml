@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump type"
+        description: "Version bump type (auto = derive from commit messages since the last tag)"
         required: true
-        default: "minor"
+        default: "auto"
         type: choice
         options:
+          - auto
           - patch
           - minor
           - major
@@ -27,29 +28,131 @@ on:
         required: false
         default: false
         type: boolean
-  # Manual only. Releases used to be cut automatically after every green CI
-  # run on main, which meant a README typo produced a new patch version.
-  # Run this from Actions -> Release -> Run workflow when there is
-  # something worth shipping.
+  # Automatic path: after every green CI run on main, the `plan` job reads
+  # the conventional-commit prefixes since the last tag and decides whether
+  # anything is worth shipping and how big the bump is. docs/ci/chore-only
+  # pushes release nothing.
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
 
 permissions:
   actions: read
   contents: write
 
 jobs:
-  release:
+  plan:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       !contains(github.event.workflow_run.head_commit.message, 'chore: bump version refs'))
     runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.bump.outputs.skip }}
+      bump: ${{ steps.bump.outputs.bump }}
     env:
-      RELEASE_SHA: ${{ github.sha }}
-      RELEASE_BUMP: ${{ inputs.bump }}
-      RELEASE_DRY_RUN: ${{ inputs.dry_run }}
-      RELEASE_PRERELEASE: ${{ inputs.prerelease }}
-      ALLOW_FIRST_RELEASE: ${{ inputs.allow_first_release }}
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      REQUESTED_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'auto' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Determine bump from commits since the last tag
+        id: bump
+        run: |
+          set -euo pipefail
+          if [ "${REQUESTED_BUMP}" != "auto" ]; then
+            echo "Bump requested explicitly: ${REQUESTED_BUMP}"
+            echo "bump=${REQUESTED_BUMP}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)
+          RANGE="${CURRENT:+${CURRENT}..}${RELEASE_SHA}"
+          echo "Classifying commits in ${RANGE}:"
+
+          # Conventional-commit rules, semantic-release defaults:
+          #   type!: / BREAKING CHANGE          -> major
+          #   feat:                             -> minor
+          #   fix: perf: revert:                -> patch
+          #   docs: ci: chore: test: style:
+          #   build: refactor:                  -> no release
+          # A subject with no recognised prefix is treated as patch: this
+          # is firmware, and an unlabelled code change should ship rather
+          # than sit unreleased because of a commit-message slip.
+          BUMP=none
+          while IFS= read -r SHA; do
+            SUBJECT=$(git log -1 --format=%s "$SHA")
+            BODY=$(git log -1 --format=%b "$SHA")
+            LEVEL=patch
+            if [[ "$SUBJECT" =~ ^[A-Za-z]+(\([^\)]*\))?!: ]] || grep -qE '^BREAKING[ -]CHANGE' <<<"$BODY"; then
+              LEVEL=major
+            elif [[ "$SUBJECT" =~ ^feat(\([^\)]*\))?: ]]; then
+              LEVEL=minor
+            elif [[ "$SUBJECT" =~ ^(fix|perf|revert)(\([^\)]*\))?: ]]; then
+              LEVEL=patch
+            elif [[ "$SUBJECT" =~ ^(docs|ci|chore|test|tests|style|build|refactor)(\([^\)]*\))?: ]]; then
+              LEVEL=none
+            fi
+            printf '  %-5s %s\n' "$LEVEL" "$SUBJECT"
+            case "$LEVEL" in
+              major) BUMP=major ;;
+              minor) if [ "$BUMP" != major ]; then BUMP=minor; fi ;;
+              patch) if [ "$BUMP" = none ]; then BUMP=patch; fi ;;
+            esac
+          done < <(git rev-list --no-merges "$RANGE")
+
+          if [ "$BUMP" = none ]; then
+            echo "No releasable commits since ${CURRENT:-the beginning}."
+            {
+              echo "### No release"
+              echo
+              echo "No feat/fix/perf commits since \`${CURRENT:-the beginning}\`; nothing to ship."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "bump=none" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Never ship without notes. On the automatic path an empty
+          # Unreleased section is a skip with a warning, not a failure:
+          # the fix is to add entries and push again.
+          if ! python3 scripts/changelog.py extract > /dev/null 2>&1; then
+            echo "::warning::Commits since ${CURRENT} warrant a ${BUMP} release, but CHANGELOG.md's Unreleased section is empty. Add entries and push again, or run the Release workflow by hand."
+            {
+              echo "### Release skipped"
+              echo
+              echo "A **${BUMP}** bump is due, but \`CHANGELOG.md\` has no Unreleased entries. Add them and push again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Automatic bump: ${BUMP}"
+          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_BUMP: ${{ needs.plan.outputs.bump }}
+      RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      RELEASE_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+      ALLOW_FIRST_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_first_release || false }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       # ------------------------------------------------------------------
       # Gate: never tag a commit whose CI didn't pass.
@@ -278,8 +381,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --quiet && exit 0
-          # The push below triggers CI on main, which is fine: releases are
-          # manual, so nothing recurses from it.
+          # The push below triggers CI on main. The plan job's gate skips
+          # runs whose head commit carries this message, and a chore:
+          # prefix classifies as no-release anyway, so nothing recurses.
           git commit -m "chore: bump version refs to ${NEW} and roll CHANGELOG"
 
           # Push straight to main. This repository's Actions settings do not

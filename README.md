@@ -225,7 +225,7 @@ Other Sub-Zero, Wolf, and Cove appliances with BLE use the same protocol and sho
 - [BLE protocol reference](docs/ble-protocol.md): GATT layout, handshake, commands, example responses.
 - [CHANGELOG](CHANGELOG.md)
 
-Releases are cut automatically from the commit messages: after a green CI run on `main`, a `feat:` commit produces a minor release, `fix:` a patch, and `docs:` or `ci:` nothing. Each release stamps `sw_version` in `settings-example.yaml`. For reproducible builds, change `ref: main` in `subzero.yaml` to a release tag such as `ref: v3.8.4`.
+Releases are cut automatically from the commit messages: after a green CI run on `main`, a `feat:` commit produces a minor release, `fix:` a patch, and `docs:` or `ci:` nothing. Each release stamps `sw_version` in `settings-example.yaml`. For reproducible builds, change `ref: main` in `subzero.yaml` to a release tag such as `ref: v3.8.5`.
 
 ## License and acknowledgements
 

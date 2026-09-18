@@ -19,6 +19,8 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+## [3.8.5] - 2026-09-18
+
 ### Changed
 
 - Rewrite the documentation in Markdown and condense it. `README.adoc`,

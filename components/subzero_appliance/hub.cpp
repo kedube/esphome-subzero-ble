@@ -249,7 +249,7 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
   std::snprintf(reason, sizeof(reason), "0x%02X %s", smp,
                 auth_fail_reason_str(fail_reason));
   publish_pairing_error_(reason);
-  char status[80];
+  char status[96];
   std::snprintf(status, sizeof(status), "Pairing failed (%s)", reason);
   publish_status_(status);
 

@@ -269,7 +269,7 @@ jobs:
           ap_wifi_ssid: "SubZero CI Fallback"
           ap_wifi_password: "test-password"
           ota_password: "ci-dummy-ota-password"
-          encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          encryption_key: "3QN5vejisXefhqXg5T3qLUTtp8f1/hE8Z2XUlgTTe+c="
           EOF
 
       - name: Validate configs before tagging

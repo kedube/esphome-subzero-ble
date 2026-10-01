@@ -155,6 +155,10 @@ std::optional<std::string> dishwasher_notif_event(JsonObjectConst root) {
     return std::string("wash_cycle_complete");
   case 304:
     return std::string("rinse_aid_low");
+  case 305:
+    // Upstream issue #120: DW2450 fault 600149 (diverter position) arrived
+    // as notif_type 305 alongside props.service_required=true.
+    return std::string("service_required");
   case 306:
     return std::string("wash_cycle_interrupted");
   case 307:
@@ -448,6 +452,8 @@ FridgeState parse_fridge_in_place(std::string &json, bool capture_keys) {
   // Power / smart grid.
   state.unit_on = opt_bool(data["unit_on"]);
   state.smart_grid_on = opt_bool(data["smart_grid_on"]);
+
+  state.accent_light_level = opt_int(data["accent_light_level"]);
 
   // Misc diagnostics.
   state.pin_window_open = opt_bool(data["pin_window_open"]);

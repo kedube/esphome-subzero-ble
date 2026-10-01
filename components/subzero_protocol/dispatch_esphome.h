@@ -314,6 +314,12 @@ struct FridgeBus : CommonBus {
   esphome::binary_sensor::BinarySensor *unit_on = nullptr;
   esphome::binary_sensor::BinarySensor *smart_grid_on = nullptr;
 
+  // accent_light_level is an int where 0 = off. Exposed as an on/off
+  // switch; the last non-zero level is remembered so turning it back on
+  // restores the model's own on-level (see ApplianceSetLevelSwitch).
+  esphome::switch_::Switch *accent_light = nullptr;
+  int accent_light_on_level = 0;
+
   // Misc diagnostics.
   esphome::binary_sensor::BinarySensor *pin_window_open = nullptr;
   esphome::text_sensor::TextSensor *active_faults = nullptr;
@@ -434,6 +440,11 @@ struct FridgeBus : CommonBus {
   }
   void publish_unit_on(bool v) { detail::publish_if(unit_on, v); }
   void publish_smart_grid_on(bool v) { detail::publish_if(smart_grid_on, v); }
+  void publish_accent_light_level(int v) {
+    if (v > 0)
+      accent_light_on_level = v;
+    detail::publish_if(accent_light, v > 0);
+  }
   void publish_pin_window_open(bool v) {
     detail::publish_if(pin_window_open, v);
   }

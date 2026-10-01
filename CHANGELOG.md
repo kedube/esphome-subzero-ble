@@ -19,6 +19,18 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+### Added
+
+- Accent Light switch for fridge and wine units, behind a new
+  `hide_accent_light` flag (default `true`). It follows the front panel live
+  and writes `accent_light_level`: `0` to turn off, and the last non-zero
+  level the appliance reported to turn on, so each model gets its own
+  brightness back. Confirmed on an IW30R; other models are unverified.
+  Backport of upstream v3.8.0 (#122).
+- Dishwasher `notif_type` 305 now reports `service_required` on the
+  Notification Event sensor instead of `dishwasher_event_305`. A DW2450
+  sent it for a diverter-position fault. Backport of upstream v3.8.0 (#121).
+
 ## [3.8.5] - 2026-09-18
 
 ### Changed

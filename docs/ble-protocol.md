@@ -148,3 +148,5 @@ Pushes on D6:
 ```
 
 A full fridge poll also carries `frz_set_temp`, `ice_maker_on`, `max_ice_on`, `night_ice_on`, `water_filter_pct_remaining`, `water_filter_gal_remaining`, `air_filter_pct_remaining`, `air_filter_on`, a `version` object with `fw`, `api`, `bleapp`, `os`, and `appliance` board strings, and the appliance's own Wi-Fi details. The complete captures used by the test suite are in `tests/fixtures/`.
+
+Many fridge and wine units (IW30R, DEU2450WDZ, PRO3650G) also report `accent_light_level`, an integer where `0` is off. Toggling the accent light on an IW30R front panel pushes `{"props":{"accent_light_level":30}}` (on) and `{"props":{"accent_light_level":0}}` (off) on D6. PRO3650G and DEU2450WDZ have reported `50` and `130`, so the on-value is model-specific. It is writable: on an IW30R (fw 2.27), `set accent_light_level` to `30` or `0` toggles the light, the appliance echoes the same push on D6, and the next full poll holds the new value. Unverified on other models.

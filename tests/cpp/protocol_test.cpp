@@ -126,6 +126,7 @@ json fridge_to_json(const FridgeState &s) {
   OPT_PUT(o, s, max_ice_end_time);
   OPT_PUT(o, s, unit_on);
   OPT_PUT(o, s, smart_grid_on);
+  OPT_PUT(o, s, accent_light_level);
   OPT_PUT(o, s, pin_window_open);
   OPT_PUT(o, s, active_faults);
   OPT_PUT(o, s, humidity_control);
@@ -552,6 +553,19 @@ TEST(ProtocolTest, DishwasherWashCycleCompleteEvent) {
   ASSERT_TRUE(d.valid);
   ASSERT_TRUE(d.notif_event.has_value());
   EXPECT_EQ(*d.notif_event, "wash_cycle_complete");
+}
+
+TEST(ProtocolTest, DishwasherServiceRequiredEvent) {
+  auto d = parse_dishwasher(R"({
+    "seq":47,"timestamp":"2026-09-20T16:33:13.907-05:00",
+    "props":{"service_required":true},
+    "notif_seq":1,"notif_type":305,"msg_types":6
+  })");
+  ASSERT_TRUE(d.valid);
+  ASSERT_TRUE(d.notif_event.has_value());
+  EXPECT_EQ(*d.notif_event, "service_required");
+  ASSERT_TRUE(d.common.service_required.has_value());
+  EXPECT_TRUE(*d.common.service_required);
 }
 
 TEST(ProtocolTest, RangeOvenPreheatCompleteEvent) {

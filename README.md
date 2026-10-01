@@ -96,6 +96,7 @@ Hidden entities are left out of the firmware entirely, which saves RAM. Defaults
 | `hide_water_filter` | `true` | Water Filter Remaining (%) |
 | `hide_water_filter_extra` | `true` | Water Filter Gallons Remaining, Water Filter Expires |
 | `hide_vacation_ice_modes` | `true` | Long and Short Vacation, High Usage, Max Ice, Night Ice modes, and the Appliance Mode and Night Mode selects |
+| `hide_accent_light` | `true` | Accent Light. Set `false` on models that report it, such as the IW30R, DEU2450WDZ, and PRO3650G. |
 | `hide_extra_diagnostics` | `true` | Smart Grid Mode, Pairing Window Open, Door Ajar Alarm Timeout, the appliance's own Wi-Fi details, Active Faults, and the Humidity Control select |
 | `hide_softener` | `true` | Water Softener Low (dishwasher) |
 | `hide_oven2` | `true` | Every Oven 2 entity (range) |
@@ -120,6 +121,7 @@ Fridge firmware exposes set points only. Measured compartment temperatures are n
 | Air Filter, Air Filter Remaining, Air Filter Expires | This is the appliance's Air Purifier toggle. Writable with `enable_mode_selects`. |
 | Water Filter Remaining, Gallons Remaining, Expires | Not every model reports all three. |
 | Long and Short Vacation, High Usage, Max Ice, Night Ice | Mode flags, with start and end times where the appliance reports them. |
+| Accent Light | On/off switch, `hide_accent_light: false`. The appliance reports a level (`0` is off; on is `30` on an IW30R, `50` or `130` on other models), so turning it on writes back the last non-zero level it reported, or `30` before it has reported one. Confirmed both ways on an IW30R (fw 2.27); other models are unverified. |
 | Power On, Service Required, Smart Grid Mode, Pairing Window Open, Door Ajar Alarm Timeout, Wi-Fi details, Active Faults | Informational. Smart Grid Mode cannot be written. |
 | Appliance Model, Appliance Uptime | Uptime is seconds since power-up (`device_class: duration`). |
 

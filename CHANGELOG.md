@@ -19,6 +19,8 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+## [3.8.6] - 2026-10-01
+
 ### Added
 
 - Accent Light switch for fridge and wine units, behind a new

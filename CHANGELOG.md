@@ -19,6 +19,8 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+## [3.8.7] - 2026-10-02
+
 ### Fixed
 
 - Count a failed connection attempt as one stale-bond strike, not two. When

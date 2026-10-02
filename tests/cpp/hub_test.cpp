@@ -107,6 +107,16 @@ protected:
     scheduler_.advance_by(3000);
   }
 
+  // Bounces every subscribe write for insufficient authentication until
+  // the hub gives up on encryption and drops the link itself.
+  void exhaust_encryption_retries_() {
+    for (int i = 0; i < SubzeroHub::kMaxEncryptionRetries; ++i) {
+      hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+      scheduler_.advance_by(SubzeroHub::kEncryptionRetryDelayMs);
+    }
+    hub_.handle_write_failed(0x12, SubzeroHub::kGattInsufAuthentication);
+  }
+
   std::vector<GattDbEntry> full_gatt_db() {
     return {
         make_char_entry(0xD5, 0x10),
@@ -1331,6 +1341,61 @@ TEST_F(HubFixture, AuthFailure_BeforeHandlesRead_StillStrikes) {
 
   hub_.handle_auth_complete(false, 86, 0); // REPEATED_ATTEMPTS, BTA offset
   EXPECT_EQ(hub_.fast_retries(), 1);
+}
+
+// Field regression (Refrigerator and Wine Cooler, both stuck encrypting):
+// the hub runs out of encryption retries and drops the link, then
+// Bluedroid reports the pairing that drop cut short as AUTH_CMPL
+// CONN_TOUT, then the disconnect event lands. One failed attempt, one
+// strike; it used to count twice and clear the bond every second attempt.
+TEST_F(HubFixture, EncryptionGiveUp_AbortedPairingCountsOnce) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  exhaust_encryption_retries_();
+  ASSERT_FALSE(transport_.connected());
+  hub_.handle_auth_complete(false, 102, 0); // SMP 0x19 CONN_TOUT, BTA offset
+  hub_.handle_disconnected();
+
+  EXPECT_EQ(hub_.fast_retries(), 1);
+  EXPECT_EQ(transport_.remove_bond_count(), 0u);
+  ASSERT_FALSE(pairing_error_log_.empty());
+  EXPECT_NE(pairing_error_log_.back().find("CONN_TOUT"), std::string::npos)
+      << "The aborted pairing is still reported, just not double-counted.";
+}
+
+// Same attempt, opposite event order: the disconnect is counted first and
+// the late AUTH_CMPL must not add a second strike.
+TEST_F(HubFixture, AuthFailure_AfterDisconnectEvent_CountsOnce) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  transport_.set_connected(false);
+  hub_.handle_disconnected();
+  hub_.handle_auth_complete(false, 102, 0);
+
+  EXPECT_EQ(hub_.fast_retries(), 1);
+}
+
+TEST_F(HubFixture, EncryptionGiveUp_ClearsBondOnThirdAttemptNotSecond) {
+  hub_.set_stored_pin("12345");
+  run_to_ready_();
+
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    if (attempt > 1) {
+      transport_.set_connected(true);
+      hub_.handle_connected(); // fast path, handles cached
+      scheduler_.advance_by(1500);
+      ASSERT_TRUE(hub_.subscribe_running()) << "attempt " << attempt;
+    }
+    exhaust_encryption_retries_();
+    hub_.handle_auth_complete(false, 102, 0);
+    hub_.handle_disconnected();
+    EXPECT_EQ(transport_.remove_bond_count(), attempt < 3 ? 0u : 1u)
+        << "attempt " << attempt;
+  }
+  EXPECT_EQ(hub_.d5_handle(), 0);
+  EXPECT_EQ(hub_.phase(), 0);
 }
 
 // SMP REPEATED_ATTEMPTS is a lockout that only decays while we stop

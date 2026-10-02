@@ -262,14 +262,20 @@ void SubzeroHub::handle_auth_complete(bool success, int fail_reason,
   enc_retry_pending_ = false;
 
   // A bonded appliance that now refuses us is the stale-bond case the
-  // three-strikes logic exists for. The failure can arrive before
-  // post_bond_initial_ has read the handles (the appliance's own Security
-  // Request on connect), so look them up now; if D5 is visible we were
-  // bonded before.
-  if (d5_handle_ == 0)
+  // three-strikes logic exists for. Only a refusal on a live link counts
+  // here. Once the link is down or closing (we gave up on encryption and
+  // disconnected, or the appliance dropped us), Bluedroid also reports the
+  // pairing it cut short as a failure (SMP CONN_TOUT), and
+  // handle_disconnected() counts that drop whichever event lands first.
+  // Counting it here as well cleared the bond every second attempt.
+  // The failure can arrive before post_bond_initial_ has read the handles
+  // (the appliance's own Security Request on connect), so look them up
+  // now; if D5 is visible we were bonded before.
+  const bool link_up = transport_->connected();
+  if (link_up && d5_handle_ == 0)
     update_handles_from_db_();
   bool bond_cleared = false;
-  if (d5_handle_ > 0 && phase_ >= 1)
+  if (link_up && d5_handle_ > 0 && phase_ >= 1)
     bond_cleared = note_bond_failure_();
 
   if (smp == 0x09) {

@@ -19,6 +19,16 @@ after a release — the workflow expects it.
 
 ## [Unreleased]
 
+### Fixed
+
+- Count a failed connection attempt as one stale-bond strike, not two. When
+  the link never finished encrypting, the hub dropped it, and Bluedroid then
+  reported the pairing that drop cut short as `0x19 CONN_TOUT`. Both that
+  report and the disconnect counted as strikes, so the ESP32 wiped its bond
+  every second failed attempt (about every 35 seconds) instead of every
+  third. A pairing failure now counts on its own only while the link is up;
+  otherwise the disconnect is the one strike, whichever event arrives first.
+
 ## [3.8.6] - 2026-10-01
 
 ### Added
